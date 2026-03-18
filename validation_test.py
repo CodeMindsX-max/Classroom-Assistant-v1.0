@@ -35,6 +35,7 @@ BASE_TIMETABLE = [
 def write_json(path, data):
     with open(path, "w", encoding="utf-8") as file:
         json.dump(data, file, indent=2)
+    tm.clear_storage_cache()
 
 
 # This expects one specific failure path and prints a pass when it happens
@@ -91,6 +92,7 @@ def print_validation_story():
     print("- Time validation proved that class slots must use HH:MM format and stay within the allowed duration.")
     print("- Add and edit validation proved that duplicate slots, bad days, and bad fields are blocked safely.")
     print("- Delete, recycle bin, restore, and permanent delete checks proved that recovery flows are working.")
+    print("- Cache checks proved that repeated operations reuse loaded data instead of rereading the JSON files.")
     print("- Stored JSON corruption checks proved that invalid timetable or recycle-bin files are detected early.")
     print("- Main-file prompt checks proved that menu helpers guide the user, retry bad input, and respect cancel words.")
     print("- Because every test ran on temporary files, the real timetable and recycle bin stayed untouched.")
@@ -117,6 +119,36 @@ with tempfile.TemporaryDirectory() as temp_dir:
         start, end = tm.validate_time_range("10:00", "12:00")
         expect_equal("validate_time_range valid start", start, "10:00")
         expect_equal("validate_time_range valid end", end, "12:00")
+
+        tm.clear_storage_cache()
+        read_counts = {"timetable": 0, "recycle": 0}
+        original_read_timetable_file = tm._read_timetable_file
+        original_read_recycle_bin_file = tm._read_recycle_bin_file
+
+        def counted_read_timetable_file():
+            read_counts["timetable"] += 1
+            return original_read_timetable_file()
+
+        def counted_read_recycle_bin_file():
+            read_counts["recycle"] += 1
+            return original_read_recycle_bin_file()
+
+        tm._read_timetable_file = counted_read_timetable_file
+        tm._read_recycle_bin_file = counted_read_recycle_bin_file
+        try:
+            tm.initialize_storage()
+            tm.get_entry_by_id("mon_1")
+            tm.edit_entry("mon_1", class_name="Advanced Math")
+            recycle_record = tm.delete_entry("tue_1")
+            tm.restore_entry(recycle_record["recycle_id"])
+            expect_equal("cache reads timetable only once", read_counts["timetable"], 1)
+            expect_equal("cache reads recycle bin only once", read_counts["recycle"], 1)
+        finally:
+            tm._read_timetable_file = original_read_timetable_file
+            tm._read_recycle_bin_file = original_read_recycle_bin_file
+
+        write_json(timetable_path, BASE_TIMETABLE)
+        write_json(recycle_bin_path, [])
 
         expect_exception(
             "validate_time_range same time",
@@ -246,8 +278,8 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
         expect_exception(
             "edit_entry invalid id",
-            lambda: tm.edit_entry("bad_id", class_name="Nope"),
-            ValueError,
+            lambda: tm.edit_entry("abc_1", class_name="Nope"),
+            LookupError,
             "No entry found",
         )
 
@@ -304,6 +336,29 @@ with tempfile.TemporaryDirectory() as temp_dir:
         )
         expect_equal("permanently_delete_recycle_entry recycle count", len(tm.load_recycle_bin()), 0)
 
+        write_json(
+            timetable_path,
+            [
+                {
+                    "id": "mon_2",
+                    "day": "Monday",
+                    "start_time": "09:00",
+                    "end_time": "10:00",
+                    "class_name": "Physics",
+                    "classroom_url": "https://example.com/physics",
+                }
+            ],
+        )
+        write_json(recycle_bin_path, [])
+        reused_entry = tm.add_entry(
+            "Monday",
+            "10:00",
+            "11:00",
+            "Chemistry",
+            "https://example.com/chemistry",
+        )
+        expect_equal("add_entry reuses first missing id", reused_entry["id"], "mon_1")
+
         expect_exception(
             "delete_entry invalid id type",
             lambda: tm.delete_entry(None),
@@ -313,8 +368,8 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
         expect_exception(
             "delete_entry missing id",
-            lambda: tm.delete_entry("missing_1"),
-            ValueError,
+            lambda: tm.delete_entry("abc_1"),
+            LookupError,
             "No entry found",
         )
 
@@ -342,7 +397,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         expect_exception(
             "get_recycle_record_by_id missing recycle id",
             lambda: tm.get_recycle_record_by_id("bin_9"),
-            ValueError,
+            LookupError,
             "No recycle bin entry found",
         )
 
@@ -365,6 +420,9 @@ with tempfile.TemporaryDirectory() as temp_dir:
             tm.load_timetable,
             tm.DuplicateTimeSlotError,
         )
+
+        duplicate_loaded = tm.load_timetable(allow_duplicate_slots=True)
+        expect_equal("load_timetable allows duplicate slot cleanup mode", len(duplicate_loaded), 3)
 
         write_json(
             timetable_path,
@@ -410,6 +468,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
         with open(timetable_path, "w", encoding="utf-8") as file:
             file.write("{bad json")
+        tm.clear_storage_cache()
         expect_exception(
             "load_timetable invalid json",
             tm.load_timetable,
@@ -617,5 +676,6 @@ with tempfile.TemporaryDirectory() as temp_dir:
         traceback.print_exc()
         raise
     finally:
+        tm.clear_storage_cache()
         tm.TIMETABLE_FILE = original_timetable_file
         tm.RECYCLE_BIN_FILE = original_recycle_file

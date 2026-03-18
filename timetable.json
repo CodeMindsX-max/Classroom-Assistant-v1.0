@@ -120,19 +120,27 @@
     "classroom_url": "https://classroom.google.com/c/COAL2026"
   },
   {
-    "id": "mon_1",
-    "day": "Monday",
-    "start_time": "08:00",
-    "end_time": "09:00",
-    "class_name": "ML",
-    "classroom_url": "https://meet.google.com/vhz-dfxm-uca"
-  },
-  {
     "id": "mon_2",
     "day": "Monday",
     "start_time": "10:00",
     "end_time": "11:00",
     "class_name": "COAL",
     "classroom_url": "https://meet.google.com/vhz-dfxm-uca"
+  },
+  {
+    "id": "mon_3",
+    "day": "Monday",
+    "start_time": "08:00",
+    "end_time": "09:00",
+    "class_name": "ML",
+    "classroom_url": "kkkkkkk"
+  },
+  {
+    "id": "mon_4",
+    "day": "Monday",
+    "start_time": "9:00",
+    "end_time": "10:00",
+    "class_name": "CMD",
+    "classroom_url": "odkawponf"
   }
 ]

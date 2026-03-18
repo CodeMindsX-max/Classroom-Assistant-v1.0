@@ -8,6 +8,7 @@ from timetable_manager import (
     edit_entry,
     get_entry_by_id,
     get_recycle_record_by_id,
+    initialize_storage,
     load_timetable,
     load_recycle_bin,
     permanently_delete_recycle_entry,
@@ -394,17 +395,16 @@ def handle_recycle_bin():
 # This is the main program loop that validates startup data,
 # shows the menu, and routes the user into each feature.
 def main():
-    while True:
-        try:
-            load_timetable()
-        except DuplicateTimeSlotError as exc:
-            if not resolve_duplicate_slots(exc):
-                break
-            continue
-        except Exception as exc:
-            print(f"Error: {exc}")
-            break
+    try:
+        initialize_storage()
+    except DuplicateTimeSlotError as exc:
+        if not resolve_duplicate_slots(exc):
+            return
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return
 
+    while True:
         print("\nTimetable Manager")
         print("1. Show timetable")
         print("2. Add entry")

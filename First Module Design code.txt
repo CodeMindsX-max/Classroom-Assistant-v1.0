@@ -1,0 +1,1108 @@
+#main.py
+(
+from datetime import datetime
+
+from timetable_manager import (
+    DuplicateTimeSlotError,
+    VALID_DAYS,
+    add_entry,
+    delete_entry,
+    edit_entry,
+    get_entry_by_id,
+    get_recycle_record_by_id,
+    load_timetable,
+    load_recycle_bin,
+    permanently_delete_recycle_entry,
+    restore_entry,
+    validate_time_range,
+)
+
+DAY_ORDER = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+]
+CANCEL_KEYWORDS = {"back", "cancel", "menu"}
+
+
+class UserCancelledOperation(Exception):
+    """Raised when the user cancels the current menu action."""
+
+
+# This watches raw user input and raises a clean cancel signal
+# so any feature can stop safely and return to the main menu.
+def _check_cancel(value):
+    if value.strip().lower() in CANCEL_KEYWORDS:
+        raise UserCancelledOperation("Action cancelled. Returning to the main menu.")
+    return value
+
+
+# This asks for required text and returns a non-empty value
+# so important ids, names, and urls are not left blank.
+def prompt_required(label):
+    while True:
+        value = _check_cancel(input(f"{label}: ").strip())
+        if value:
+            return value
+        print(f"{label} is required. Type 'back' to return to the main menu.")
+
+
+# This asks for a weekday, normalizes it, and returns the cleaned day
+# so the menu sends valid day names into the manager layer.
+def prompt_day(label, allow_blank=False):
+    valid_days_text = ", ".join(sorted(VALID_DAYS))
+
+    while True:
+        value = _check_cancel(input(f"{label}: ").strip())
+
+        if not value and allow_blank:
+            return ""
+
+        normalized_value = value.title()
+        if normalized_value in VALID_DAYS:
+            return normalized_value
+
+        print(f"Invalid day. Use a full day name: {valid_days_text}. Type 'back' to cancel.")
+
+
+# This asks for one time value and returns a validated HH:MM string
+# so add and edit flows get clean time input from the user.
+def prompt_time(label, allow_blank=False):
+    while True:
+        value = _check_cancel(input(f"{label}: ").strip())
+
+        if not value and allow_blank:
+            return ""
+
+        try:
+            datetime.strptime(value, "%H:%M")
+            return value
+        except ValueError:
+            print("Invalid time. Use HH:MM format, for example 09:30. Type 'back' to cancel.")
+
+
+# This asks for optional text and returns it unchanged when present
+# so edit can keep old values when the user leaves a field blank.
+def prompt_optional(label):
+    return _check_cancel(
+        input(f"{label} (leave blank to keep current value): ").strip()
+    )
+
+
+# This asks for a yes/no answer and returns True or False
+# so risky actions like delete can require explicit confirmation.
+def prompt_yes_no(label):
+    while True:
+        value = _check_cancel(input(f"{label} (y/n): ").strip()).lower()
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        print("Please enter y or n. Type 'back' to cancel.")
+
+
+# This loads active timetable data and prints it as a table
+# so the user can clearly review current class entries.
+def show_timetable():
+    timetable = load_timetable()
+
+    if not timetable:
+        print("No timetable entries found.")
+        return
+
+    rows = [
+        [
+            entry["id"],
+            entry["day"],
+            entry["start_time"],
+            entry["end_time"],
+            entry["class_name"],
+            entry["classroom_url"],
+        ]
+        for entry in _sorted_timetable_entries(timetable)
+    ]
+    print("\nCurrent timetable:")
+    _print_table(
+        ["ID", "Day", "Start", "End", "Class Name", "Classroom URL"],
+        rows,
+    )
+
+
+# This sorts timetable entries by weekday and start time and returns that list
+# so every timetable display stays consistent and easy to read.
+def _sorted_timetable_entries(timetable):
+    day_order_map = {day: index for index, day in enumerate(DAY_ORDER)}
+    return sorted(
+        timetable,
+        key=lambda entry: (
+            day_order_map.get(entry["day"], len(DAY_ORDER)),
+            entry["start_time"],
+            entry["id"],
+        ),
+    )
+
+
+# This prints any list of rows as an aligned text table
+# so timetable and recycle-bin views share one display format.
+def _print_table(headers, rows):
+    column_widths = [
+        max(len(str(item)) for item in [header] + [row[index] for row in rows])
+        for index, header in enumerate(headers)
+    ]
+
+    def format_row(row):
+        return " | ".join(
+            str(value).ljust(column_widths[index]) for index, value in enumerate(row)
+        )
+
+    separator = "-+-".join("-" * width for width in column_widths)
+
+    print(format_row(headers))
+    print(separator)
+    for row in rows:
+        print(format_row(row))
+
+
+# This loads recycle-bin data, prints it, and returns whether data existed
+# so callers can avoid asking for recycle ids when the bin is empty.
+def show_recycle_bin():
+    recycle_bin = load_recycle_bin()
+
+    if not recycle_bin:
+        print("Recycle bin is empty.")
+        return False
+
+    rows = [
+        [
+            record["recycle_id"],
+            record["entry"]["id"],
+            record["entry"]["day"],
+            record["entry"]["start_time"],
+            record["entry"]["end_time"],
+            record["entry"]["class_name"],
+            record["deleted_at"],
+        ]
+        for record in recycle_bin
+    ]
+
+    print("\nRecycle bin:")
+    _print_table(
+        ["Recycle ID", "Entry ID", "Day", "Start", "End", "Class Name", "Deleted At"],
+        rows,
+    )
+    return True
+
+
+# This guides the user through duplicate-slot cleanup on startup
+# and returns whether the app can continue normal work afterward.
+def resolve_duplicate_slots(error):
+    print("\nDuplicate timetable slots were found in timetable.json.")
+
+    for group_number, duplicate_group in enumerate(error.duplicates, start=1):
+        first_entry = duplicate_group[0]
+        print(
+            f"\nDuplicate group {group_number}: "
+            f"{first_entry['day']} {first_entry['start_time']}-{first_entry['end_time']}"
+        )
+        for entry in duplicate_group:
+            print(
+                f"  ID: {entry['id']} | Class: {entry['class_name']} | "
+                f"URL: {entry['classroom_url']}"
+            )
+
+    if not prompt_yes_no("Do you want to delete duplicate entries now?"):
+        print("Please clean the duplicate timetable entries before continuing.")
+        return False
+
+    for duplicate_group in error.duplicates:
+        while True:
+            keep_id = prompt_required(
+                f"Enter the ID you want to keep for "
+                f"{duplicate_group[0]['day']} "
+                f"{duplicate_group[0]['start_time']}-{duplicate_group[0]['end_time']}"
+            )
+            valid_ids = {entry["id"] for entry in duplicate_group}
+            if keep_id not in valid_ids:
+                print("Invalid ID. Please choose one of the IDs shown above.")
+                continue
+
+            for entry in duplicate_group:
+                if entry["id"] != keep_id:
+                    delete_entry(entry["id"], allow_duplicate_slots=True)
+                    print(f"Deleted duplicate entry: {entry['id']}")
+            break
+
+    print("Duplicate timetable entries were cleaned successfully.")
+    return True
+
+
+# This collects add-entry input, validates it step by step,
+# and creates a new timetable entry through the manager layer.
+def handle_add():
+    print("\nAdd Entry. Type 'back' at any prompt to return to the main menu.")
+    day = prompt_day("Day")
+    while True:
+        start_time = prompt_time("Start time (HH:MM)")
+        end_time = prompt_time("End time (HH:MM)")
+        try:
+            start_time, end_time = validate_time_range(start_time, end_time)
+            break
+        except ValueError as exc:
+            print(f"Error: {exc}")
+
+    class_name = prompt_required("Class name")
+    url = prompt_required("Classroom URL")
+
+    entry = add_entry(day, start_time, end_time, class_name, url)
+    print(f"Entry added successfully: {entry['id']}")
+
+
+# This collects edit input, keeps unchanged values when fields are blank,
+# and returns control after updating the selected timetable entry.
+def handle_edit():
+    print("\nEdit Entry. Type 'back' at any prompt to return to the main menu.")
+    entry_id = prompt_required("Entry ID to edit")
+    current_entry = get_entry_by_id(entry_id)
+    print("Enter only the fields you want to update.")
+
+    updates = {}
+    day = prompt_day("New day (leave blank to keep current value)", allow_blank=True)
+
+    while True:
+        start_time = prompt_time(
+            "New start time (HH:MM) (leave blank to keep current value)",
+            allow_blank=True,
+        )
+        end_time = prompt_time(
+            "New end time (HH:MM) (leave blank to keep current value)",
+            allow_blank=True,
+        )
+
+        proposed_start_time = start_time or current_entry["start_time"]
+        proposed_end_time = end_time or current_entry["end_time"]
+
+        try:
+            validate_time_range(proposed_start_time, proposed_end_time)
+            break
+        except ValueError as exc:
+            print(f"Error: {exc}")
+
+    class_name = prompt_optional("New class name")
+    classroom_url = prompt_optional("New classroom URL")
+
+    if day:
+        updates["day"] = day
+    if start_time:
+        updates["start_time"] = start_time
+    if end_time:
+        updates["end_time"] = end_time
+    if class_name:
+        updates["class_name"] = class_name
+    if classroom_url:
+        updates["classroom_url"] = classroom_url
+
+    if not updates:
+        print("No changes entered.")
+        return
+
+    updated_entry = edit_entry(entry_id, **updates)
+    print(f"Entry updated successfully: {updated_entry['id']}")
+
+
+# This shows the chosen class, asks for confirmation,
+# and moves the entry into the recycle bin if approved.
+def handle_delete():
+    print("\nDelete Entry. Type 'back' at any prompt to return to the main menu.")
+    entry_id = prompt_required("Entry ID to delete")
+    entry = get_entry_by_id(entry_id)
+
+    print("\nEntry selected for deletion:")
+    _print_table(
+        ["ID", "Day", "Start", "End", "Class Name", "Classroom URL"],
+        [[
+            entry["id"],
+            entry["day"],
+            entry["start_time"],
+            entry["end_time"],
+            entry["class_name"],
+            entry["classroom_url"],
+        ]],
+    )
+
+    if not prompt_yes_no("Do you want to move this entry to the recycle bin"):
+        print("Deletion cancelled. Entry was not removed.")
+        return
+
+    deleted_record = delete_entry(entry_id)
+    print(
+        f"Entry moved to recycle bin successfully: "
+        f"{deleted_record['entry']['id']} -> {deleted_record['recycle_id']}"
+    )
+
+
+# This runs the recycle-bin submenu for viewing, restoring,
+# and permanently deleting archived entries.
+def handle_recycle_bin():
+    print("\nRecycle Bin. Type 'back' at any prompt to return to the main menu.")
+
+    while True:
+        print("\nRecycle Bin Menu")
+        print("1. Show recycle bin")
+        print("2. Restore entry")
+        print("3. Delete permanently")
+        print("4. Return to main menu")
+
+        choice = _check_cancel(input("Choose an option: ").strip())
+
+        if choice == "1":
+            show_recycle_bin()
+        elif choice == "2":
+            if not show_recycle_bin():
+                continue
+            recycle_id = prompt_required("Recycle ID to restore")
+            record = get_recycle_record_by_id(recycle_id)
+            restored_entry = restore_entry(recycle_id)
+            print(
+                f"Restored entry successfully: "
+                f"{record['entry']['id']} from {record['recycle_id']}"
+            )
+            print(f"Restored timetable entry id: {restored_entry['id']}")
+        elif choice == "3":
+            if not show_recycle_bin():
+                continue
+            recycle_id = prompt_required("Recycle ID to delete permanently")
+            record = get_recycle_record_by_id(recycle_id)
+            if not prompt_yes_no(
+                f"Are you sure you want to permanently delete {record['entry']['id']} from the recycle bin"
+            ):
+                print("Permanent deletion cancelled.")
+                continue
+            deleted_record = permanently_delete_recycle_entry(recycle_id)
+            print(
+                f"Permanently deleted recycle bin entry: "
+                f"{deleted_record['recycle_id']}"
+            )
+        elif choice == "4":
+            print("Returning to the main menu.")
+            return
+        else:
+            print("Invalid choice. Please enter a number from 1 to 4.")
+
+
+# This is the main program loop that validates startup data,
+# shows the menu, and routes the user into each feature.
+def main():
+    while True:
+        try:
+            load_timetable()
+        except DuplicateTimeSlotError as exc:
+            if not resolve_duplicate_slots(exc):
+                break
+            continue
+        except Exception as exc:
+            print(f"Error: {exc}")
+            break
+
+        print("\nTimetable Manager")
+        print("1. Show timetable")
+        print("2. Add entry")
+        print("3. Edit entry")
+        print("4. Delete entry")
+        print("5. Recycle bin")
+        print("6. Exit")
+
+        choice = input("Choose an option: ").strip()
+
+        try:
+            if choice == "1":
+                show_timetable()
+            elif choice == "2":
+                handle_add()
+            elif choice == "3":
+                handle_edit()
+            elif choice == "4":
+                handle_delete()
+            elif choice == "5":
+                handle_recycle_bin()
+            elif choice == "6":
+                print("Goodbye.")
+                break
+            else:
+                print("Invalid choice. Please enter a number from 1 to 6.")
+        except UserCancelledOperation as exc:
+            print(exc)
+        except DuplicateTimeSlotError as exc:
+            resolve_duplicate_slots(exc)
+        except Exception as exc:
+            print(f"Error: {exc}")
+
+
+if __name__ == "__main__":
+    main()
+
+)
+
+#timetable_manager.py
+(
+import json
+import re
+from datetime import datetime
+
+
+TIMETABLE_FILE = "timetable.json"
+RECYCLE_BIN_FILE = "recycle_bin.json"
+VALID_FIELDS = {"day", "start_time", "end_time", "class_name", "classroom_url"}
+RECYCLE_ID_PATTERN = re.compile(r"^bin_\d+$")
+VALID_DAYS = {
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+}
+
+
+class TimetableError(Exception):
+    """Base exception for timetable-related errors."""
+
+
+class DuplicateTimeSlotError(TimetableError):
+    """Raised when duplicate timetable slots already exist in stored data."""
+
+    def __init__(self, duplicates):
+        self.duplicates = duplicates
+        super().__init__("Duplicate timetable slots found in stored data.")
+
+
+# This small gatekeeper checks simple text input and returns a cleaned string
+# so later functions can trust the value they receive.
+def _validate_text(value, field_name):
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string.")
+
+    cleaned_value = value.strip()
+    if not cleaned_value:
+        raise ValueError(f"{field_name} cannot be empty.")
+
+    return cleaned_value
+
+
+# This keeps recycle bin ids in one safe pattern and returns the cleaned id
+# so restore and permanent delete work only with valid recycle references.
+def _validate_recycle_id(value):
+    cleaned_value = _validate_text(value, "recycle_id")
+    if not RECYCLE_ID_PATTERN.fullmatch(cleaned_value):
+        raise ValueError("recycle_id must be in the format 'bin_<number>', for example 'bin_1'.")
+    return cleaned_value
+
+
+# This validates one time value and returns the cleaned HH:MM string
+# so all timetable operations work with one consistent time format.
+def _validate_time(value, field_name):
+    cleaned_value = _validate_text(value, field_name)
+
+    try:
+        datetime.strptime(cleaned_value, "%H:%M")
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be in HH:MM format.") from exc
+
+    return cleaned_value
+
+
+# This validates the entered day name and returns a normalized day
+# so stored timetable data always uses proper weekday names.
+def _validate_day(value):
+    cleaned_value = _validate_text(value, "day").title()
+    if cleaned_value not in VALID_DAYS:
+        valid_days_text = ", ".join(sorted(VALID_DAYS))
+        raise ValueError(f"day must be a valid day name: {valid_days_text}.")
+    return cleaned_value
+
+
+# This checks the time gap rule and returns the validated start and end times
+# so add and edit can safely build entries with allowed durations only.
+def validate_time_range(start_time, end_time):
+    """Validate that a timetable slot is at least 1 hour and at most 3 hours."""
+    validated_start = _validate_time(start_time, "start_time")
+    validated_end = _validate_time(end_time, "end_time")
+
+    start_obj = datetime.strptime(validated_start, "%H:%M")
+    end_obj = datetime.strptime(validated_end, "%H:%M")
+    gap_in_hours = (end_obj - start_obj).total_seconds() / 3600
+
+    if gap_in_hours < 1:
+        raise ValueError("The gap between start_time and end_time must be at least 1 hour.")
+    if gap_in_hours > 3:
+        raise ValueError("The gap between start_time and end_time must not be more than 3 hours.")
+
+    return validated_start, validated_end
+
+
+# This combines all field validations and returns a fully cleaned entry shape
+# so higher-level functions can save trusted timetable data.
+def _validate_entry_fields(day, start_time, end_time, class_name, classroom_url):
+    validated_day = _validate_day(day)
+    validated_start, validated_end = validate_time_range(start_time, end_time)
+    validated_name = _validate_text(class_name, "class_name")
+    validated_url = _validate_text(classroom_url, "classroom_url")
+
+    return validated_day, validated_start, validated_end, validated_name, validated_url
+
+
+# This prepares edit fields, maps alias names, and returns normalized updates
+# so edit_entry can accept friendly input without corrupting field names.
+def _normalize_update_fields(kwargs):
+    normalized = dict(kwargs)
+
+    if "url" in normalized:
+        if "classroom_url" in normalized:
+            raise ValueError("Use either 'url' or 'classroom_url', not both.")
+        normalized["classroom_url"] = normalized.pop("url")
+
+    invalid_fields = set(normalized) - VALID_FIELDS
+    if invalid_fields:
+        invalid_list = ", ".join(sorted(invalid_fields))
+        raise ValueError(f"Invalid field(s): {invalid_list}")
+
+    return normalized
+
+
+# This verifies that every timetable entry id is unique and raises early
+# so id-based lookup, edit, delete, and restore stay reliable.
+def _ensure_unique_ids(timetable):
+    seen_ids = set()
+
+    for entry in timetable:
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            raise ValueError("Each timetable entry must have a non-empty string id.")
+        if entry_id in seen_ids:
+            raise ValueError(f"Duplicate id found in timetable: {entry_id}")
+        seen_ids.add(entry_id)
+
+
+# This finds where a timetable entry lives and returns its list index
+# so callers can update or remove the exact record they asked for.
+def _find_entry_index(timetable, entry_id):
+    for index, entry in enumerate(timetable):
+        if entry.get("id") == entry_id:
+            return index
+
+    raise ValueError(f"No entry found with id '{entry_id}'.")
+
+
+# This finds a recycle bin record by recycle id and returns its position
+# so recycle operations act on the correct deleted item.
+def _find_recycle_record_index(recycle_bin, recycle_id):
+    for index, record in enumerate(recycle_bin):
+        if record.get("recycle_id") == recycle_id:
+            return index
+
+    raise ValueError(f"No recycle bin entry found with recycle_id '{recycle_id}'.")
+
+
+# This scans the timetable and returns groups of duplicate time slots
+# so the app can report and clean conflicting stored data.
+def _find_duplicate_time_slots(timetable):
+    slots = {}
+
+    for entry in timetable:
+        slot_key = (
+            entry.get("day"),
+            entry.get("start_time"),
+            entry.get("end_time"),
+        )
+        slots.setdefault(slot_key, []).append(entry)
+
+    return [entries for entries in slots.values() if len(entries) > 1]
+
+
+# This stops loading when duplicate timetable slots already exist
+# so the user can fix conflicts before normal operations continue.
+def _ensure_no_duplicate_slots(timetable):
+    duplicates = _find_duplicate_time_slots(timetable)
+    if duplicates:
+        raise DuplicateTimeSlotError(duplicates)
+
+
+# This checks whether a day/time slot is free and raises if it is occupied
+# so add, edit, and restore cannot create duplicate classes in one slot.
+def _ensure_slot_available(timetable, day, start_time, end_time, ignore_entry_id=None):
+    for entry in timetable:
+        if entry.get("id") == ignore_entry_id:
+            continue
+
+        if (
+            entry.get("day") == day
+            and entry.get("start_time") == start_time
+            and entry.get("end_time") == end_time
+        ):
+            raise ValueError(
+                f"A timetable entry already exists for {day} from {start_time} to {end_time}."
+            )
+
+
+# This thin wrapper reads the timetable source file and returns raw list data
+# so load_timetable has one clear place to fetch stored timetable records.
+def _read_timetable_file():
+    return _read_json_list_file(TIMETABLE_FILE)
+
+
+# This reads a JSON list file and returns its list content
+# so both timetable and recycle bin can share one safe file reader.
+def _read_json_list_file(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{file_path} was not found.") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{file_path} contains invalid JSON.") from exc
+    except OSError as exc:
+        raise OSError(f"Could not read {file_path}: {exc}") from exc
+
+    if not isinstance(data, list):
+        raise ValueError(f"{file_path} must contain a list of entries.")
+
+    return data
+
+
+# This validates every saved timetable record and returns nothing on success
+# so save and load only work with strong, trusted timetable data.
+def _validate_timetable_entries(data):
+    _ensure_unique_ids(data)
+    for entry in data:
+        _validate_text(entry.get("id"), "id")
+        _validate_entry_fields(
+            entry.get("day"),
+            entry.get("start_time"),
+            entry.get("end_time"),
+            entry.get("class_name"),
+            entry.get("classroom_url"),
+        )
+
+
+# This validates recycle bin records and their nested entries
+# so deleted data can be restored later without hidden corruption.
+def _validate_recycle_bin(recycle_bin):
+    seen_recycle_ids = set()
+
+    for record in recycle_bin:
+        if not isinstance(record, dict):
+            raise ValueError("Each recycle bin record must be an object.")
+
+        recycle_id = _validate_recycle_id(record.get("recycle_id"))
+        if recycle_id in seen_recycle_ids:
+            raise ValueError(f"Duplicate recycle_id found in recycle bin: {recycle_id}")
+        seen_recycle_ids.add(recycle_id)
+
+        _validate_text(record.get("deleted_at"), "deleted_at")
+
+        entry = record.get("entry")
+        if not isinstance(entry, dict):
+            raise ValueError("Each recycle bin record must contain an 'entry' object.")
+
+        _validate_text(entry.get("id"), "id")
+        _validate_entry_fields(
+            entry.get("day"),
+            entry.get("start_time"),
+            entry.get("end_time"),
+            entry.get("class_name"),
+            entry.get("classroom_url"),
+        )
+
+
+# This loads timetable data, validates it, and returns the clean timetable list
+# so the rest of the program always works from verified classroom data.
+def load_timetable(allow_duplicate_slots=False):
+    """Read and return timetable data from the JSON file."""
+    data = _read_timetable_file()
+    _validate_timetable_entries(data)
+    if not allow_duplicate_slots:
+        _ensure_no_duplicate_slots(data)
+    return data
+
+
+# This loads deleted records from the recycle bin and returns that list
+# so restore and permanent delete can work from validated deleted entries.
+def load_recycle_bin():
+    """Read and return recycle bin records from the JSON file."""
+    try:
+        recycle_bin = _read_json_list_file(RECYCLE_BIN_FILE)
+    except FileNotFoundError:
+        save_recycle_bin([])
+        recycle_bin = []
+
+    _validate_recycle_bin(recycle_bin)
+    return recycle_bin
+
+
+# This validates and writes timetable data back to the main JSON file
+# so successful add, edit, restore, and cleanup changes become permanent.
+def save_timetable(data):
+    """Write timetable data back to the JSON file."""
+    if not isinstance(data, list):
+        raise ValueError("Timetable data must be a list.")
+
+    _validate_timetable_entries(data)
+
+    try:
+        with open(TIMETABLE_FILE, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2, ensure_ascii=False)
+    except TypeError as exc:
+        raise ValueError(f"Timetable data contains non-JSON-serializable values: {exc}") from exc
+    except OSError as exc:
+        raise OSError(f"Could not save {TIMETABLE_FILE}: {exc}") from exc
+
+
+# This validates and writes recycle bin records to their JSON file
+# so deleted items are stored safely for later recovery.
+def save_recycle_bin(data):
+    """Write recycle bin data back to the recycle JSON file."""
+    if not isinstance(data, list):
+        raise ValueError("Recycle bin data must be a list.")
+
+    _validate_recycle_bin(data)
+
+    try:
+        with open(RECYCLE_BIN_FILE, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2, ensure_ascii=False)
+    except TypeError as exc:
+        raise ValueError(f"Recycle bin data contains non-JSON-serializable values: {exc}") from exc
+    except OSError as exc:
+        raise OSError(f"Could not save {RECYCLE_BIN_FILE}: {exc}") from exc
+
+
+# This creates one new timetable entry, saves it, and returns the new record
+# so the caller can show the created id and details to the user.
+def add_entry(day, start_time, end_time, class_name, url):
+    """Add a new class entry, generate a new id, and save it."""
+    validated_day, validated_start, validated_end, validated_name, validated_url = (
+        _validate_entry_fields(day, start_time, end_time, class_name, url)
+    )
+
+    timetable = load_timetable()
+    _ensure_slot_available(timetable, validated_day, validated_start, validated_end)
+    day_prefix = validated_day[:3].lower()
+    matching_ids = []
+
+    for entry in timetable:
+        entry_id = entry.get("id", "")
+        if isinstance(entry_id, str) and entry_id.startswith(f"{day_prefix}_"):
+            try:
+                matching_ids.append(int(entry_id.split("_")[1]))
+            except (IndexError, ValueError):
+                continue
+
+    next_number = max(matching_ids, default=0) + 1
+    new_entry = {
+        "id": f"{day_prefix}_{next_number}",
+        "day": validated_day,
+        "start_time": validated_start,
+        "end_time": validated_end,
+        "class_name": validated_name,
+        "classroom_url": validated_url,
+    }
+
+    timetable.append(new_entry)
+    save_timetable(timetable)
+    return new_entry
+
+
+# This fetches one timetable entry by id and returns that entry dictionary
+# so edit and delete can verify the exact class the user selected.
+def get_entry_by_id(entry_id):
+    """Return a timetable entry by id."""
+    validated_id = _validate_text(entry_id, "entry_id")
+    timetable = load_timetable()
+    entry_index = _find_entry_index(timetable, validated_id)
+    return timetable[entry_index]
+
+
+# This fetches one recycle bin record by recycle id and returns that record
+# so restore and permanent delete can confirm the target item first.
+def get_recycle_record_by_id(recycle_id):
+    """Return a recycle bin record by recycle_id."""
+    validated_recycle_id = _validate_recycle_id(recycle_id)
+    recycle_bin = load_recycle_bin()
+    record_index = _find_recycle_record_index(recycle_bin, validated_recycle_id)
+    return recycle_bin[record_index]
+
+
+# This updates one existing timetable entry, saves the timetable,
+# and returns the updated entry so the caller can show the new result.
+def edit_entry(entry_id, **kwargs):
+    """Update an existing entry by id and save the changes.
+
+    Pass only the fields you want to change, for example:
+    edit_entry("tue_2", class_name="Physics", start_time="10:00")
+    """
+    validated_id = _validate_text(entry_id, "entry_id")
+    updates = _normalize_update_fields(kwargs)
+
+    if not updates:
+        raise ValueError("Provide at least one field to update.")
+
+    timetable = load_timetable()
+
+    for entry in timetable:
+        if entry.get("id") == validated_id:
+            updated_entry = {
+                "day": updates.get("day", entry.get("day")),
+                "start_time": updates.get("start_time", entry.get("start_time")),
+                "end_time": updates.get("end_time", entry.get("end_time")),
+                "class_name": updates.get("class_name", entry.get("class_name")),
+                "classroom_url": updates.get("classroom_url", entry.get("classroom_url")),
+            }
+
+            (
+                updated_day,
+                updated_start,
+                updated_end,
+                updated_name,
+                updated_url,
+            ) = _validate_entry_fields(
+                updated_entry["day"],
+                updated_entry["start_time"],
+                updated_entry["end_time"],
+                updated_entry["class_name"],
+                updated_entry["classroom_url"],
+            )
+            _ensure_slot_available(
+                timetable,
+                updated_day,
+                updated_start,
+                updated_end,
+                ignore_entry_id=validated_id,
+            )
+
+            entry["day"] = updated_day
+            entry["start_time"] = updated_start
+            entry["end_time"] = updated_end
+            entry["class_name"] = updated_name
+            entry["classroom_url"] = updated_url
+
+            save_timetable(timetable)
+            return entry
+
+    raise ValueError(f"No entry found with id '{validated_id}'.")
+
+
+# This soft-deletes a timetable entry, moves it into the recycle bin,
+# and returns the recycle record so the caller can show where it went.
+def delete_entry(entry_id, allow_duplicate_slots=False):
+    """Soft-delete an entry by moving it into the recycle bin."""
+    validated_id = _validate_text(entry_id, "entry_id")
+    timetable = load_timetable(allow_duplicate_slots=allow_duplicate_slots)
+    recycle_bin = load_recycle_bin()
+    entry_index = _find_entry_index(timetable, validated_id)
+    deleted_entry = timetable[entry_index].copy()
+    next_recycle_number = len(recycle_bin) + 1
+
+    while any(record.get("recycle_id") == f"bin_{next_recycle_number}" for record in recycle_bin):
+        next_recycle_number += 1
+
+    recycle_record = {
+        "recycle_id": f"bin_{next_recycle_number}",
+        "deleted_at": datetime.now().isoformat(timespec="seconds"),
+        "entry": deleted_entry,
+    }
+
+    timetable.pop(entry_index)
+    recycle_bin.append(recycle_record)
+    save_timetable(timetable)
+    save_recycle_bin(recycle_bin)
+    return recycle_record
+
+
+# This restores one deleted entry back into the timetable and returns it
+# so the caller can confirm the class is active again.
+def restore_entry(recycle_id, allow_duplicate_slots=False):
+    """Restore a recycle bin entry back into the timetable."""
+    validated_recycle_id = _validate_recycle_id(recycle_id)
+    timetable = load_timetable(allow_duplicate_slots=allow_duplicate_slots)
+    recycle_bin = load_recycle_bin()
+    record_index = _find_recycle_record_index(recycle_bin, validated_recycle_id)
+    recycle_record = recycle_bin[record_index]
+    entry_to_restore = recycle_record["entry"].copy()
+
+    if any(entry.get("id") == entry_to_restore["id"] for entry in timetable):
+        raise ValueError(
+            f"Cannot restore entry because id '{entry_to_restore['id']}' already exists in the timetable."
+        )
+
+    _ensure_slot_available(
+        timetable,
+        entry_to_restore["day"],
+        entry_to_restore["start_time"],
+        entry_to_restore["end_time"],
+    )
+
+    timetable.append(entry_to_restore)
+    recycle_bin.pop(record_index)
+    save_timetable(timetable)
+    save_recycle_bin(recycle_bin)
+    return entry_to_restore
+
+
+# This removes one recycle bin record forever and returns that removed record
+# so the caller can confirm permanent deletion happened.
+def permanently_delete_recycle_entry(recycle_id):
+    """Remove an entry from the recycle bin permanently."""
+    validated_recycle_id = _validate_recycle_id(recycle_id)
+    recycle_bin = load_recycle_bin()
+    record_index = _find_recycle_record_index(recycle_bin, validated_recycle_id)
+    deleted_record = recycle_bin.pop(record_index)
+    save_recycle_bin(recycle_bin)
+    return deleted_record
+
+)
+
+
+#timetable.json
+(
+[
+  {
+    "id": "tue_1",
+    "day": "Tuesday",
+    "start_time": "08:00",
+    "end_time": "09:00",
+    "class_name": "Machine Learning",
+    "classroom_url": "https://classroom.google.com/c/ML2026"
+  },
+  {
+    "id": "tue_2",
+    "day": "Tuesday",
+    "start_time": "09:00",
+    "end_time": "10:00",
+    "class_name": "Programming for AI",
+    "classroom_url": "https://classroom.google.com/c/PAI2026"
+  },
+  {
+    "id": "tue_3",
+    "day": "Tuesday",
+    "start_time": "10:00",
+    "end_time": "11:00",
+    "class_name": "Expository Writing",
+    "classroom_url": "https://classroom.google.com/c/EW2026"
+  },
+  {
+    "id": "tue_4",
+    "day": "Tuesday",
+    "start_time": "11:00",
+    "end_time": "12:00",
+    "class_name": "Translation of Quran",
+    "classroom_url": "https://classroom.google.com/c/TQ2026"
+  },
+  {
+    "id": "tue_5",
+    "day": "Tuesday",
+    "start_time": "12:00",
+    "end_time": "13:00",
+    "class_name": "Theory of Automata",
+    "classroom_url": "https://classroom.google.com/c/TOA2026"
+  },
+  {
+    "id": "wed_1",
+    "day": "Wednesday",
+    "start_time": "08:00",
+    "end_time": "09:00",
+    "class_name": "Programming for AI",
+    "classroom_url": "https://classroom.google.com/c/PAI2026"
+  },
+  {
+    "id": "wed_2",
+    "day": "Wednesday",
+    "start_time": "09:00",
+    "end_time": "10:00",
+    "class_name": "Islamic Studies",
+    "classroom_url": "https://classroom.google.com/c/IS2026"
+  },
+  {
+    "id": "wed_3",
+    "day": "Wednesday",
+    "start_time": "10:00",
+    "end_time": "11:00",
+    "class_name": "Programming for AI",
+    "classroom_url": "https://classroom.google.com/c/PAI2026"
+  },
+  {
+    "id": "thu_1",
+    "day": "Thursday",
+    "start_time": "08:00",
+    "end_time": "09:00",
+    "class_name": "Theory of Automata",
+    "classroom_url": "https://classroom.google.com/c/TOA2026"
+  },
+  {
+    "id": "thu_2",
+    "day": "Thursday",
+    "start_time": "09:00",
+    "end_time": "10:00",
+    "class_name": "COAL",
+    "classroom_url": "https://classroom.google.com/c/COAL2026"
+  },
+  {
+    "id": "thu_3",
+    "day": "Thursday",
+    "start_time": "10:00",
+    "end_time": "11:00",
+    "class_name": "Machine Learning",
+    "classroom_url": "https://classroom.google.com/c/ML2026"
+  },
+  {
+    "id": "thu_4",
+    "day": "Thursday",
+    "start_time": "11:00",
+    "end_time": "12:00",
+    "class_name": "COAL",
+    "classroom_url": "https://classroom.google.com/c/COAL2026"
+  },
+  {
+    "id": "fri_1",
+    "day": "Friday",
+    "start_time": "08:00",
+    "end_time": "09:00",
+    "class_name": "Expository Writing",
+    "classroom_url": "https://classroom.google.com/c/EW2026"
+  },
+  {
+    "id": "fri_2",
+    "day": "Friday",
+    "start_time": "09:00",
+    "end_time": "10:00",
+    "class_name": "Machine Learning",
+    "classroom_url": "https://classroom.google.com/c/ML2026"
+  },
+  {
+    "id": "fri_3",
+    "day": "Friday",
+    "start_time": "10:00",
+    "end_time": "11:00",
+    "class_name": "COAL",
+    "classroom_url": "https://classroom.google.com/c/COAL2026"
+  },
+  {
+    "id": "mon_1",
+    "day": "Monday",
+    "start_time": "08:00",
+    "end_time": "09:00",
+    "class_name": "ML",
+    "classroom_url": "https://meet.google.com/vhz-dfxm-uca"
+  },
+  {
+    "id": "mon_2",
+    "day": "Monday",
+    "start_time": "10:00",
+    "end_time": "11:00",
+    "class_name": "COAL",
+    "classroom_url": "https://meet.google.com/vhz-dfxm-uca"
+  }
+]
+)

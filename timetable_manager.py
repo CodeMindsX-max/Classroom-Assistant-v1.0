@@ -1,5 +1,8 @@
+import copy
 import json
+import os
 import re
+import tempfile
 from datetime import datetime
 
 
@@ -7,6 +10,7 @@ TIMETABLE_FILE = "timetable.json"
 RECYCLE_BIN_FILE = "recycle_bin.json"
 VALID_FIELDS = {"day", "start_time", "end_time", "class_name", "classroom_url"}
 RECYCLE_ID_PATTERN = re.compile(r"^bin_\d+$")
+ENTRY_ID_PATTERN = re.compile(r"^[a-z]{3}_\d+$")
 VALID_DAYS = {
     "Monday",
     "Tuesday",
@@ -22,7 +26,23 @@ class TimetableError(Exception):
     """Base exception for timetable-related errors."""
 
 
-class DuplicateTimeSlotError(TimetableError):
+class TimetableValidationError(TimetableError, ValueError):
+    """Raised when user or stored data does not match validation rules."""
+
+
+class TimetableStorageError(TimetableError, OSError):
+    """Raised when reading or writing storage files fails."""
+
+
+class TimetableNotFoundError(TimetableError, LookupError):
+    """Raised when an entry or recycle record cannot be found."""
+
+
+class TimetableConflictError(TimetableError, ValueError):
+    """Raised when a new change conflicts with existing timetable data."""
+
+
+class DuplicateTimeSlotError(TimetableConflictError):
     """Raised when duplicate timetable slots already exist in stored data."""
 
     def __init__(self, duplicates):
@@ -30,15 +50,19 @@ class DuplicateTimeSlotError(TimetableError):
         super().__init__("Duplicate timetable slots found in stored data.")
 
 
+TIMETABLE_CACHE = None
+RECYCLE_BIN_CACHE = None
+
+
 # This small gatekeeper checks simple text input and returns a cleaned string
 # so later functions can trust the value they receive.
 def _validate_text(value, field_name):
     if not isinstance(value, str):
-        raise ValueError(f"{field_name} must be a string.")
+        raise TimetableValidationError(f"{field_name} must be a string.")
 
     cleaned_value = value.strip()
     if not cleaned_value:
-        raise ValueError(f"{field_name} cannot be empty.")
+        raise TimetableValidationError(f"{field_name} cannot be empty.")
 
     return cleaned_value
 
@@ -48,7 +72,20 @@ def _validate_text(value, field_name):
 def _validate_recycle_id(value):
     cleaned_value = _validate_text(value, "recycle_id")
     if not RECYCLE_ID_PATTERN.fullmatch(cleaned_value):
-        raise ValueError("recycle_id must be in the format 'bin_<number>', for example 'bin_1'.")
+        raise TimetableValidationError(
+            "recycle_id must be in the format 'bin_<number>', for example 'bin_1'."
+        )
+    return cleaned_value
+
+
+# This validates one timetable entry id and returns the cleaned id
+# so id-based operations always work with the expected stored format.
+def _validate_entry_id(value):
+    cleaned_value = _validate_text(value, "entry_id")
+    if not ENTRY_ID_PATTERN.fullmatch(cleaned_value):
+        raise TimetableValidationError(
+            "entry_id must be in the format '<day_prefix>_<number>', for example 'mon_1'."
+        )
     return cleaned_value
 
 
@@ -60,7 +97,7 @@ def _validate_time(value, field_name):
     try:
         datetime.strptime(cleaned_value, "%H:%M")
     except ValueError as exc:
-        raise ValueError(f"{field_name} must be in HH:MM format.") from exc
+        raise TimetableValidationError(f"{field_name} must be in HH:MM format.") from exc
 
     return cleaned_value
 
@@ -71,14 +108,19 @@ def _validate_day(value):
     cleaned_value = _validate_text(value, "day").title()
     if cleaned_value not in VALID_DAYS:
         valid_days_text = ", ".join(sorted(VALID_DAYS))
-        raise ValueError(f"day must be a valid day name: {valid_days_text}.")
+        raise TimetableValidationError(f"day must be a valid day name: {valid_days_text}.")
     return cleaned_value
+
+
+# This builds one reusable slot key for lookup and conflict checks
+# so slot comparisons stay consistent across add, edit, load, and restore.
+def _slot_key(day, start_time, end_time):
+    return day, start_time, end_time
 
 
 # This checks the time gap rule and returns the validated start and end times
 # so add and edit can safely build entries with allowed durations only.
 def validate_time_range(start_time, end_time):
-    """Validate that a timetable slot is at least 1 hour and at most 3 hours."""
     validated_start = _validate_time(start_time, "start_time")
     validated_end = _validate_time(end_time, "end_time")
 
@@ -87,9 +129,13 @@ def validate_time_range(start_time, end_time):
     gap_in_hours = (end_obj - start_obj).total_seconds() / 3600
 
     if gap_in_hours < 1:
-        raise ValueError("The gap between start_time and end_time must be at least 1 hour.")
+        raise TimetableValidationError(
+            "The gap between start_time and end_time must be at least 1 hour."
+        )
     if gap_in_hours > 3:
-        raise ValueError("The gap between start_time and end_time must not be more than 3 hours.")
+        raise TimetableValidationError(
+            "The gap between start_time and end_time must not be more than 3 hours."
+        )
 
     return validated_start, validated_end
 
@@ -112,96 +158,143 @@ def _normalize_update_fields(kwargs):
 
     if "url" in normalized:
         if "classroom_url" in normalized:
-            raise ValueError("Use either 'url' or 'classroom_url', not both.")
+            raise TimetableValidationError("Use either 'url' or 'classroom_url', not both.")
         normalized["classroom_url"] = normalized.pop("url")
 
     invalid_fields = set(normalized) - VALID_FIELDS
     if invalid_fields:
         invalid_list = ", ".join(sorted(invalid_fields))
-        raise ValueError(f"Invalid field(s): {invalid_list}")
+        raise TimetableValidationError(f"Invalid field(s): {invalid_list}")
 
     return normalized
 
 
-# This verifies that every timetable entry id is unique and raises early
-# so id-based lookup, edit, delete, and restore stay reliable.
-def _ensure_unique_ids(timetable):
-    seen_ids = set()
+# This validates one timetable entry object and returns a clean copy
+# so the rest of the system works from one trusted entry structure.
+def _validate_entry(entry):
+    if not isinstance(entry, dict):
+        raise TimetableValidationError("Each timetable entry must be an object.")
 
-    for entry in timetable:
-        entry_id = entry.get("id")
-        if not isinstance(entry_id, str) or not entry_id.strip():
-            raise ValueError("Each timetable entry must have a non-empty string id.")
-        if entry_id in seen_ids:
-            raise ValueError(f"Duplicate id found in timetable: {entry_id}")
-        seen_ids.add(entry_id)
+    validated_id = _validate_entry_id(entry.get("id"))
+    (
+        validated_day,
+        validated_start,
+        validated_end,
+        validated_name,
+        validated_url,
+    ) = _validate_entry_fields(
+        entry.get("day"),
+        entry.get("start_time"),
+        entry.get("end_time"),
+        entry.get("class_name"),
+        entry.get("classroom_url"),
+    )
+
+    return {
+        "id": validated_id,
+        "day": validated_day,
+        "start_time": validated_start,
+        "end_time": validated_end,
+        "class_name": validated_name,
+        "classroom_url": validated_url,
+    }
 
 
-# This finds where a timetable entry lives and returns its list index
-# so callers can update or remove the exact record they asked for.
-def _find_entry_index(timetable, entry_id):
+# This validates one recycle-bin record and returns a clean copy
+# so deleted entries remain safe to inspect, restore, or purge later.
+def _validate_recycle_record(record):
+    if not isinstance(record, dict):
+        raise TimetableValidationError("Each recycle bin record must be an object.")
+
+    validated_recycle_id = _validate_recycle_id(record.get("recycle_id"))
+    deleted_at = _validate_text(record.get("deleted_at"), "deleted_at")
+
+    try:
+        datetime.fromisoformat(deleted_at)
+    except ValueError as exc:
+        raise TimetableValidationError("deleted_at must be a valid ISO datetime string.") from exc
+
+    validated_entry = _validate_entry(record.get("entry"))
+
+    return {
+        "recycle_id": validated_recycle_id,
+        "deleted_at": deleted_at,
+        "entry": validated_entry,
+    }
+
+
+# This scans entries once and returns reusable indexes for ids, slots, and prefixes
+# so the code avoids repeated linear scans during reads, updates, and id generation.
+def _build_timetable_indexes(timetable):
+    id_to_index = {}
+    slot_to_indexes = {}
+    prefix_to_numbers = {}
+
     for index, entry in enumerate(timetable):
-        if entry.get("id") == entry_id:
-            return index
+        entry_id = entry["id"]
+        if entry_id in id_to_index:
+            raise TimetableValidationError(f"Duplicate id found in timetable: {entry_id}")
+        id_to_index[entry_id] = index
 
-    raise ValueError(f"No entry found with id '{entry_id}'.")
+        slot = _slot_key(entry["day"], entry["start_time"], entry["end_time"])
+        slot_to_indexes.setdefault(slot, []).append(index)
+
+        prefix, suffix = entry_id.split("_", 1)
+        prefix_to_numbers.setdefault(prefix, set()).add(int(suffix))
+
+    return id_to_index, slot_to_indexes, prefix_to_numbers
 
 
-# This finds a recycle bin record by recycle id and returns its position
-# so recycle operations act on the correct deleted item.
-def _find_recycle_record_index(recycle_bin, recycle_id):
+# This builds a recycle-id index map and checks for duplicate recycle ids
+# so recycle lookup stays fast and invalid stored recycle data is caught early.
+def _build_recycle_index_map(recycle_bin):
+    recycle_index_map = {}
+
     for index, record in enumerate(recycle_bin):
-        if record.get("recycle_id") == recycle_id:
-            return index
+        recycle_id = record["recycle_id"]
+        if recycle_id in recycle_index_map:
+            raise TimetableValidationError(
+                f"Duplicate recycle_id found in recycle bin: {recycle_id}"
+            )
+        recycle_index_map[recycle_id] = index
 
-    raise ValueError(f"No recycle bin entry found with recycle_id '{recycle_id}'.")
-
-
-# This scans the timetable and returns groups of duplicate time slots
-# so the app can report and clean conflicting stored data.
-def _find_duplicate_time_slots(timetable):
-    slots = {}
-
-    for entry in timetable:
-        slot_key = (
-            entry.get("day"),
-            entry.get("start_time"),
-            entry.get("end_time"),
-        )
-        slots.setdefault(slot_key, []).append(entry)
-
-    return [entries for entries in slots.values() if len(entries) > 1]
+    return recycle_index_map
 
 
-# This stops loading when duplicate timetable slots already exist
-# so the user can fix conflicts before normal operations continue.
-def _ensure_no_duplicate_slots(timetable):
-    duplicates = _find_duplicate_time_slots(timetable)
+# This finds the first free positive number for one day prefix and returns it
+# so deleted ids like mon_1 can be reused instead of always creating mon_3.
+def _get_first_available_number(used_numbers):
+    candidate = 1
+    while candidate in used_numbers:
+        candidate += 1
+    return candidate
+
+
+# This checks that every slot appears only once and returns nothing on success
+# so stored or cached timetable data stays conflict-free for normal operations.
+def _ensure_no_duplicate_slots_from_index(timetable, slot_to_indexes):
+    duplicates = []
+
+    for indexes in slot_to_indexes.values():
+        if len(indexes) > 1:
+            duplicates.append([copy.deepcopy(timetable[index]) for index in indexes])
+
     if duplicates:
         raise DuplicateTimeSlotError(duplicates)
 
 
 # This checks whether a day/time slot is free and raises if it is occupied
 # so add, edit, and restore cannot create duplicate classes in one slot.
-def _ensure_slot_available(timetable, day, start_time, end_time, ignore_entry_id=None):
-    for entry in timetable:
-        if entry.get("id") == ignore_entry_id:
+def _ensure_slot_available_from_index(slot_to_indexes, day, start_time, end_time, ignore_entry_id=None, id_to_index=None):
+    slot = _slot_key(day, start_time, end_time)
+    indexes = slot_to_indexes.get(slot, [])
+
+    for index in indexes:
+        if ignore_entry_id and id_to_index and id_to_index.get(ignore_entry_id) == index:
             continue
-
-        if (
-            entry.get("day") == day
-            and entry.get("start_time") == start_time
-            and entry.get("end_time") == end_time
-        ):
-            raise ValueError(
-                f"A timetable entry already exists for {day} from {start_time} to {end_time}."
-            )
-
-
-# This thin wrapper reads the timetable source file and returns raw list data
-# so load_timetable has one clear place to fetch stored timetable records.
-def _read_timetable_file():
-    return _read_json_list_file(TIMETABLE_FILE)
+        raise TimetableConflictError(
+            f"A timetable entry already exists for {day} from {start_time} to {end_time}."
+        )
 
 
 # This reads a JSON list file and returns its list content
@@ -213,144 +306,180 @@ def _read_json_list_file(file_path):
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"{file_path} was not found.") from exc
     except json.JSONDecodeError as exc:
-        raise ValueError(f"{file_path} contains invalid JSON.") from exc
+        raise TimetableValidationError(f"{file_path} contains invalid JSON.") from exc
     except OSError as exc:
-        raise OSError(f"Could not read {file_path}: {exc}") from exc
+        raise TimetableStorageError(f"Could not read {file_path}: {exc}") from exc
 
     if not isinstance(data, list):
-        raise ValueError(f"{file_path} must contain a list of entries.")
+        raise TimetableValidationError(f"{file_path} must contain a list of entries.")
 
     return data
 
 
-# This validates every saved timetable record and returns nothing on success
-# so save and load only work with strong, trusted timetable data.
-def _validate_timetable_entries(data):
-    _ensure_unique_ids(data)
-    for entry in data:
-        _validate_text(entry.get("id"), "id")
-        _validate_entry_fields(
-            entry.get("day"),
-            entry.get("start_time"),
-            entry.get("end_time"),
-            entry.get("class_name"),
-            entry.get("classroom_url"),
-        )
+# This thin wrapper reads the timetable source file and returns raw list data
+# so timetable loading keeps one clear file-read path.
+def _read_timetable_file():
+    return _read_json_list_file(TIMETABLE_FILE)
 
 
-# This validates recycle bin records and their nested entries
-# so deleted data can be restored later without hidden corruption.
+# This thin wrapper reads the recycle-bin source file and returns raw list data
+# so recycle-bin loading keeps one clear file-read path.
+def _read_recycle_bin_file():
+    return _read_json_list_file(RECYCLE_BIN_FILE)
+
+
+# This writes JSON through a temporary file and swaps it into place
+# so saves are safer against partial writes or interrupted program exits.
+def _atomic_write_json_list_file(file_path, data):
+    directory = os.path.dirname(os.path.abspath(file_path)) or "."
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=directory,
+            delete=False,
+            suffix=".tmp",
+        ) as temp_file:
+            json.dump(data, temp_file, indent=2, ensure_ascii=False)
+            temp_path = temp_file.name
+
+        os.replace(temp_path, file_path)
+    except TypeError as exc:
+        raise TimetableValidationError(
+            f"{file_path} contains non-JSON-serializable values: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise TimetableStorageError(f"Could not save {file_path}: {exc}") from exc
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+# This validates every saved timetable record and returns a clean list copy
+# so load and save only work with trusted timetable data.
+def _validate_timetable_entries(data, allow_duplicate_slots=False):
+    if not isinstance(data, list):
+        raise TimetableValidationError("Timetable data must be a list.")
+
+    validated_entries = [_validate_entry(entry) for entry in data]
+    _, slot_to_indexes, _ = _build_timetable_indexes(validated_entries)
+    if not allow_duplicate_slots:
+        _ensure_no_duplicate_slots_from_index(validated_entries, slot_to_indexes)
+    return validated_entries
+
+
+# This validates recycle bin records and returns a clean list copy
+# so deleted data remains safe for later restore and cleanup operations.
 def _validate_recycle_bin(recycle_bin):
-    seen_recycle_ids = set()
+    if not isinstance(recycle_bin, list):
+        raise TimetableValidationError("Recycle bin data must be a list.")
+
+    validated_records = []
 
     for record in recycle_bin:
-        if not isinstance(record, dict):
-            raise ValueError("Each recycle bin record must be an object.")
+        validated_record = _validate_recycle_record(record)
+        validated_records.append(validated_record)
 
-        recycle_id = _validate_recycle_id(record.get("recycle_id"))
-        if recycle_id in seen_recycle_ids:
-            raise ValueError(f"Duplicate recycle_id found in recycle bin: {recycle_id}")
-        seen_recycle_ids.add(recycle_id)
+    _build_recycle_index_map(validated_records)
+    return validated_records
 
-        _validate_text(record.get("deleted_at"), "deleted_at")
 
-        entry = record.get("entry")
-        if not isinstance(entry, dict):
-            raise ValueError("Each recycle bin record must contain an 'entry' object.")
+# This creates a detached copy of list data before exposing it to callers
+# so read helpers do not leak internal cache references by mistake.
+def _clone_list_data(data):
+    return copy.deepcopy(data)
 
-        _validate_text(entry.get("id"), "id")
-        _validate_entry_fields(
-            entry.get("day"),
-            entry.get("start_time"),
-            entry.get("end_time"),
-            entry.get("class_name"),
-            entry.get("classroom_url"),
+
+# This loads timetable data into memory one time, validates it, and returns the cache
+# so repeated lookups do not keep hitting the disk.
+def load_timetable(allow_duplicate_slots=False):
+    global TIMETABLE_CACHE
+
+    if TIMETABLE_CACHE is None:
+        TIMETABLE_CACHE = _validate_timetable_entries(
+            _read_timetable_file(),
+            allow_duplicate_slots=allow_duplicate_slots,
         )
 
-
-# This loads timetable data, validates it, and returns the clean timetable list
-# so the rest of the program always works from verified classroom data.
-def load_timetable(allow_duplicate_slots=False):
-    """Read and return timetable data from the JSON file."""
-    data = _read_timetable_file()
-    _validate_timetable_entries(data)
     if not allow_duplicate_slots:
-        _ensure_no_duplicate_slots(data)
-    return data
+        _, slot_to_indexes, _ = _build_timetable_indexes(TIMETABLE_CACHE)
+        _ensure_no_duplicate_slots_from_index(TIMETABLE_CACHE, slot_to_indexes)
+
+    return TIMETABLE_CACHE
 
 
-# This loads deleted records from the recycle bin and returns that list
-# so restore and permanent delete can work from validated deleted entries.
+# This loads recycle-bin data into memory one time, validates it, and returns the cache
+# so restore and permanent delete can work without repeated file reads.
 def load_recycle_bin():
-    """Read and return recycle bin records from the JSON file."""
-    try:
-        recycle_bin = _read_json_list_file(RECYCLE_BIN_FILE)
-    except FileNotFoundError:
-        save_recycle_bin([])
-        recycle_bin = []
+    global RECYCLE_BIN_CACHE
 
-    _validate_recycle_bin(recycle_bin)
-    return recycle_bin
+    if RECYCLE_BIN_CACHE is None:
+        try:
+            RECYCLE_BIN_CACHE = _validate_recycle_bin(_read_recycle_bin_file())
+        except FileNotFoundError:
+            RECYCLE_BIN_CACHE = []
+            _atomic_write_json_list_file(RECYCLE_BIN_FILE, RECYCLE_BIN_CACHE)
+
+    return RECYCLE_BIN_CACHE
 
 
-# This validates and writes timetable data back to the main JSON file
-# so successful add, edit, restore, and cleanup changes become permanent.
+# This resets in-memory caches and then loads both JSON sources once
+# so the application can validate storage at startup before user actions begin.
+def initialize_storage():
+    clear_storage_cache()
+    load_timetable()
+    load_recycle_bin()
+
+
+# This clears in-memory caches so tests or manual reload flows can force fresh disk reads
+# when the source files are changed outside the current process.
+def clear_storage_cache():
+    global TIMETABLE_CACHE, RECYCLE_BIN_CACHE
+
+    TIMETABLE_CACHE = None
+    RECYCLE_BIN_CACHE = None
+
+
+# This validates and writes timetable data back to disk and cache
+# so add, edit, and restore changes become permanent safely.
 def save_timetable(data):
-    """Write timetable data back to the JSON file."""
-    if not isinstance(data, list):
-        raise ValueError("Timetable data must be a list.")
+    global TIMETABLE_CACHE
 
-    _validate_timetable_entries(data)
-
-    try:
-        with open(TIMETABLE_FILE, "w", encoding="utf-8") as file:
-            json.dump(data, file, indent=2, ensure_ascii=False)
-    except TypeError as exc:
-        raise ValueError(f"Timetable data contains non-JSON-serializable values: {exc}") from exc
-    except OSError as exc:
-        raise OSError(f"Could not save {TIMETABLE_FILE}: {exc}") from exc
+    validated_entries = _validate_timetable_entries(data)
+    _atomic_write_json_list_file(TIMETABLE_FILE, validated_entries)
+    TIMETABLE_CACHE = _clone_list_data(validated_entries)
+    return TIMETABLE_CACHE
 
 
-# This validates and writes recycle bin records to their JSON file
-# so deleted items are stored safely for later recovery.
+# This validates and writes recycle-bin data back to disk and cache
+# so deleted items are stored safely for recovery or permanent cleanup.
 def save_recycle_bin(data):
-    """Write recycle bin data back to the recycle JSON file."""
-    if not isinstance(data, list):
-        raise ValueError("Recycle bin data must be a list.")
+    global RECYCLE_BIN_CACHE
 
-    _validate_recycle_bin(data)
-
-    try:
-        with open(RECYCLE_BIN_FILE, "w", encoding="utf-8") as file:
-            json.dump(data, file, indent=2, ensure_ascii=False)
-    except TypeError as exc:
-        raise ValueError(f"Recycle bin data contains non-JSON-serializable values: {exc}") from exc
-    except OSError as exc:
-        raise OSError(f"Could not save {RECYCLE_BIN_FILE}: {exc}") from exc
+    validated_records = _validate_recycle_bin(data)
+    _atomic_write_json_list_file(RECYCLE_BIN_FILE, validated_records)
+    RECYCLE_BIN_CACHE = _clone_list_data(validated_records)
+    return RECYCLE_BIN_CACHE
 
 
 # This creates one new timetable entry, saves it, and returns the new record
 # so the caller can show the created id and details to the user.
 def add_entry(day, start_time, end_time, class_name, url):
-    """Add a new class entry, generate a new id, and save it."""
     validated_day, validated_start, validated_end, validated_name, validated_url = (
         _validate_entry_fields(day, start_time, end_time, class_name, url)
     )
 
     timetable = load_timetable()
-    _ensure_slot_available(timetable, validated_day, validated_start, validated_end)
+    id_to_index, slot_to_indexes, prefix_to_numbers = _build_timetable_indexes(timetable)
+    _ensure_slot_available_from_index(slot_to_indexes, validated_day, validated_start, validated_end)
+
     day_prefix = validated_day[:3].lower()
-    matching_ids = []
-
-    for entry in timetable:
-        entry_id = entry.get("id", "")
-        if isinstance(entry_id, str) and entry_id.startswith(f"{day_prefix}_"):
-            try:
-                matching_ids.append(int(entry_id.split("_")[1]))
-            except (IndexError, ValueError):
-                continue
-
-    next_number = max(matching_ids, default=0) + 1
+    next_number = _get_first_available_number(prefix_to_numbers.get(day_prefix, set()))
     new_entry = {
         "id": f"{day_prefix}_{next_number}",
         "day": validated_day,
@@ -362,101 +491,98 @@ def add_entry(day, start_time, end_time, class_name, url):
 
     timetable.append(new_entry)
     save_timetable(timetable)
-    return new_entry
+    return copy.deepcopy(new_entry)
 
 
-# This fetches one timetable entry by id and returns that entry dictionary
-# so edit and delete can verify the exact class the user selected.
+# This fetches one timetable entry by id and returns a safe copy of that entry
+# so callers can inspect it without mutating the internal cache directly.
 def get_entry_by_id(entry_id):
-    """Return a timetable entry by id."""
-    validated_id = _validate_text(entry_id, "entry_id")
+    validated_id = _validate_entry_id(entry_id)
     timetable = load_timetable()
-    entry_index = _find_entry_index(timetable, validated_id)
-    return timetable[entry_index]
+    id_to_index, _, _ = _build_timetable_indexes(timetable)
+
+    if validated_id not in id_to_index:
+        raise TimetableNotFoundError(f"No entry found with id '{validated_id}'.")
+
+    return copy.deepcopy(timetable[id_to_index[validated_id]])
 
 
-# This fetches one recycle bin record by recycle id and returns that record
+# This fetches one recycle-bin record by recycle id and returns a safe copy
 # so restore and permanent delete can confirm the target item first.
 def get_recycle_record_by_id(recycle_id):
-    """Return a recycle bin record by recycle_id."""
     validated_recycle_id = _validate_recycle_id(recycle_id)
     recycle_bin = load_recycle_bin()
-    record_index = _find_recycle_record_index(recycle_bin, validated_recycle_id)
-    return recycle_bin[record_index]
+    recycle_index_map = {
+        record["recycle_id"]: index for index, record in enumerate(recycle_bin)
+    }
+
+    if validated_recycle_id not in recycle_index_map:
+        raise TimetableNotFoundError(
+            f"No recycle bin entry found with recycle_id '{validated_recycle_id}'."
+        )
+
+    return copy.deepcopy(recycle_bin[recycle_index_map[validated_recycle_id]])
 
 
 # This updates one existing timetable entry, saves the timetable,
 # and returns the updated entry so the caller can show the new result.
 def edit_entry(entry_id, **kwargs):
-    """Update an existing entry by id and save the changes.
-
-    Pass only the fields you want to change, for example:
-    edit_entry("tue_2", class_name="Physics", start_time="10:00")
-    """
-    validated_id = _validate_text(entry_id, "entry_id")
+    validated_id = _validate_entry_id(entry_id)
     updates = _normalize_update_fields(kwargs)
 
     if not updates:
-        raise ValueError("Provide at least one field to update.")
+        raise TimetableValidationError("Provide at least one field to update.")
 
     timetable = load_timetable()
+    id_to_index, slot_to_indexes, _ = _build_timetable_indexes(timetable)
 
-    for entry in timetable:
-        if entry.get("id") == validated_id:
-            updated_entry = {
-                "day": updates.get("day", entry.get("day")),
-                "start_time": updates.get("start_time", entry.get("start_time")),
-                "end_time": updates.get("end_time", entry.get("end_time")),
-                "class_name": updates.get("class_name", entry.get("class_name")),
-                "classroom_url": updates.get("classroom_url", entry.get("classroom_url")),
-            }
+    if validated_id not in id_to_index:
+        raise TimetableNotFoundError(f"No entry found with id '{validated_id}'.")
 
-            (
-                updated_day,
-                updated_start,
-                updated_end,
-                updated_name,
-                updated_url,
-            ) = _validate_entry_fields(
-                updated_entry["day"],
-                updated_entry["start_time"],
-                updated_entry["end_time"],
-                updated_entry["class_name"],
-                updated_entry["classroom_url"],
-            )
-            _ensure_slot_available(
-                timetable,
-                updated_day,
-                updated_start,
-                updated_end,
-                ignore_entry_id=validated_id,
-            )
+    entry_index = id_to_index[validated_id]
+    current_entry = timetable[entry_index]
+    updated_entry = {
+        "id": current_entry["id"],
+        "day": updates.get("day", current_entry["day"]),
+        "start_time": updates.get("start_time", current_entry["start_time"]),
+        "end_time": updates.get("end_time", current_entry["end_time"]),
+        "class_name": updates.get("class_name", current_entry["class_name"]),
+        "classroom_url": updates.get("classroom_url", current_entry["classroom_url"]),
+    }
 
-            entry["day"] = updated_day
-            entry["start_time"] = updated_start
-            entry["end_time"] = updated_end
-            entry["class_name"] = updated_name
-            entry["classroom_url"] = updated_url
+    validated_entry = _validate_entry(updated_entry)
+    _ensure_slot_available_from_index(
+        slot_to_indexes,
+        validated_entry["day"],
+        validated_entry["start_time"],
+        validated_entry["end_time"],
+        ignore_entry_id=validated_id,
+        id_to_index=id_to_index,
+    )
 
-            save_timetable(timetable)
-            return entry
-
-    raise ValueError(f"No entry found with id '{validated_id}'.")
+    timetable[entry_index] = validated_entry
+    save_timetable(timetable)
+    return copy.deepcopy(validated_entry)
 
 
 # This soft-deletes a timetable entry, moves it into the recycle bin,
 # and returns the recycle record so the caller can show where it went.
 def delete_entry(entry_id, allow_duplicate_slots=False):
-    """Soft-delete an entry by moving it into the recycle bin."""
-    validated_id = _validate_text(entry_id, "entry_id")
+    validated_id = _validate_entry_id(entry_id)
     timetable = load_timetable(allow_duplicate_slots=allow_duplicate_slots)
     recycle_bin = load_recycle_bin()
-    entry_index = _find_entry_index(timetable, validated_id)
-    deleted_entry = timetable[entry_index].copy()
-    next_recycle_number = len(recycle_bin) + 1
+    id_to_index, _, _ = _build_timetable_indexes(timetable)
 
-    while any(record.get("recycle_id") == f"bin_{next_recycle_number}" for record in recycle_bin):
-        next_recycle_number += 1
+    if validated_id not in id_to_index:
+        raise TimetableNotFoundError(f"No entry found with id '{validated_id}'.")
+
+    entry_index = id_to_index[validated_id]
+    deleted_entry = copy.deepcopy(timetable.pop(entry_index))
+
+    existing_numbers = [
+        int(record["recycle_id"].split("_")[1]) for record in recycle_bin
+    ]
+    next_recycle_number = max(existing_numbers, default=0) + 1
 
     recycle_record = {
         "recycle_id": f"bin_{next_recycle_number}",
@@ -464,31 +590,39 @@ def delete_entry(entry_id, allow_duplicate_slots=False):
         "entry": deleted_entry,
     }
 
-    timetable.pop(entry_index)
     recycle_bin.append(recycle_record)
     save_timetable(timetable)
     save_recycle_bin(recycle_bin)
-    return recycle_record
+    return copy.deepcopy(recycle_record)
 
 
 # This restores one deleted entry back into the timetable and returns it
 # so the caller can confirm the class is active again.
 def restore_entry(recycle_id, allow_duplicate_slots=False):
-    """Restore a recycle bin entry back into the timetable."""
     validated_recycle_id = _validate_recycle_id(recycle_id)
     timetable = load_timetable(allow_duplicate_slots=allow_duplicate_slots)
     recycle_bin = load_recycle_bin()
-    record_index = _find_recycle_record_index(recycle_bin, validated_recycle_id)
-    recycle_record = recycle_bin[record_index]
-    entry_to_restore = recycle_record["entry"].copy()
 
-    if any(entry.get("id") == entry_to_restore["id"] for entry in timetable):
-        raise ValueError(
+    recycle_index_map = {
+        record["recycle_id"]: index for index, record in enumerate(recycle_bin)
+    }
+    if validated_recycle_id not in recycle_index_map:
+        raise TimetableNotFoundError(
+            f"No recycle bin entry found with recycle_id '{validated_recycle_id}'."
+        )
+
+    record_index = recycle_index_map[validated_recycle_id]
+    recycle_record = recycle_bin[record_index]
+    entry_to_restore = copy.deepcopy(recycle_record["entry"])
+    id_to_index, slot_to_indexes, _ = _build_timetable_indexes(timetable)
+
+    if entry_to_restore["id"] in id_to_index:
+        raise TimetableConflictError(
             f"Cannot restore entry because id '{entry_to_restore['id']}' already exists in the timetable."
         )
 
-    _ensure_slot_available(
-        timetable,
+    _ensure_slot_available_from_index(
+        slot_to_indexes,
         entry_to_restore["day"],
         entry_to_restore["start_time"],
         entry_to_restore["end_time"],
@@ -498,16 +632,23 @@ def restore_entry(recycle_id, allow_duplicate_slots=False):
     recycle_bin.pop(record_index)
     save_timetable(timetable)
     save_recycle_bin(recycle_bin)
-    return entry_to_restore
+    return copy.deepcopy(entry_to_restore)
 
 
-# This removes one recycle bin record forever and returns that removed record
+# This removes one recycle-bin record forever and returns that removed record
 # so the caller can confirm permanent deletion happened.
 def permanently_delete_recycle_entry(recycle_id):
-    """Remove an entry from the recycle bin permanently."""
     validated_recycle_id = _validate_recycle_id(recycle_id)
     recycle_bin = load_recycle_bin()
-    record_index = _find_recycle_record_index(recycle_bin, validated_recycle_id)
-    deleted_record = recycle_bin.pop(record_index)
+    recycle_index_map = {
+        record["recycle_id"]: index for index, record in enumerate(recycle_bin)
+    }
+
+    if validated_recycle_id not in recycle_index_map:
+        raise TimetableNotFoundError(
+            f"No recycle bin entry found with recycle_id '{validated_recycle_id}'."
+        )
+
+    deleted_record = copy.deepcopy(recycle_bin.pop(recycle_index_map[validated_recycle_id]))
     save_recycle_bin(recycle_bin)
     return deleted_record
