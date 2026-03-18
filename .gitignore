@@ -1,0 +1,88 @@
+# =========================
+# 🐍 Python cache files
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# 🧪 Virtual Environment
+# =========================
+venv/
+env/
+ENV/
+.venv/
+
+# =========================
+# 📦 Distribution / Packaging
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+*.whl
+
+# =========================
+# 🧾 Logs & temporary files
+# =========================
+*.log
+*.tmp
+*.temp
+
+# =========================
+# 🔐 Environment variables (IMPORTANT)
+# =========================
+.env
+.env.*
+*.env
+
+# =========================
+# 📊 Jupyter Notebook
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# 🧠 IDE / Editor files
+# =========================
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# Sublime / others
+*.sublime-project
+*.sublime-workspace
+
+# =========================
+# 🖥️ OS generated files
+# =========================
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Mac
+.DS_Store
+
+# =========================
+# 📈 Data files (optional - depends on project)
+# =========================
+# Uncomment if needed
+# data/
+# *.csv
+# *.xlsx
+
+# =========================
+# 🔬 Testing / coverage
+# =========================
+.coverage
+htmlcov/
+.pytest_cache/
+
+# =========================
+# 🔧 Misc
+# =========================
+*.bak
+*.swp
