@@ -1,10 +1,10 @@
-from datetime import datetime
-
 from timetable_manager import (
     DuplicateTimeSlotError,
-    VALID_DAYS,
+    InvalidTimetableEntriesError,
     add_entry,
+    build_validated_entry,
     delete_entry,
+    delete_raw_timetable_entry,
     edit_entry,
     get_entry_by_id,
     get_recycle_record_by_id,
@@ -12,8 +12,15 @@ from timetable_manager import (
     load_timetable,
     load_recycle_bin,
     permanently_delete_recycle_entry,
+    repair_timetable_entry,
     restore_entry,
+    validate_day_input,
+    validate_entry_id,
+    validate_optional_text,
+    validate_required_text,
+    validate_time_input,
     validate_time_range,
+    validate_yes_no_input,
 )
 
 DAY_ORDER = [
@@ -45,27 +52,25 @@ def _check_cancel(value):
 def prompt_required(label):
     while True:
         value = _check_cancel(input(f"{label}: ").strip())
-        if value:
-            return value
-        print(f"{label} is required. Type 'back' to return to the main menu.")
+        try:
+            return validate_required_text(value, label)
+        except ValueError as exc:
+            print(f"{exc} Type 'back' to return to the main menu.")
 
 
 # This asks for a weekday, normalizes it, and returns the cleaned day
 # so the menu sends valid day names into the manager layer.
 def prompt_day(label, allow_blank=False):
-    valid_days_text = ", ".join(sorted(VALID_DAYS))
-
     while True:
         value = _check_cancel(input(f"{label}: ").strip())
 
         if not value and allow_blank:
             return ""
 
-        normalized_value = value.title()
-        if normalized_value in VALID_DAYS:
-            return normalized_value
-
-        print(f"Invalid day. Use a full day name: {valid_days_text}. Type 'back' to cancel.")
+        try:
+            return validate_day_input(value)
+        except ValueError as exc:
+            print(f"{exc} Type 'back' to cancel.")
 
 
 # This asks for one time value and returns a validated HH:MM string
@@ -78,30 +83,29 @@ def prompt_time(label, allow_blank=False):
             return ""
 
         try:
-            datetime.strptime(value, "%H:%M")
-            return value
-        except ValueError:
-            print("Invalid time. Use HH:MM format, for example 09:30. Type 'back' to cancel.")
+            return validate_time_input(value, label)
+        except ValueError as exc:
+            print(f"{exc} Type 'back' to cancel.")
 
 
 # This asks for optional text and returns it unchanged when present
 # so edit can keep old values when the user leaves a field blank.
 def prompt_optional(label):
-    return _check_cancel(
+    value = _check_cancel(
         input(f"{label} (leave blank to keep current value): ").strip()
     )
+    return validate_optional_text(value)
 
 
 # This asks for a yes/no answer and returns True or False
 # so risky actions like delete can require explicit confirmation.
 def prompt_yes_no(label):
     while True:
-        value = _check_cancel(input(f"{label} (y/n): ").strip()).lower()
-        if value in {"y", "yes"}:
-            return True
-        if value in {"n", "no"}:
-            return False
-        print("Please enter y or n. Type 'back' to cancel.")
+        value = _check_cancel(input(f"{label} (y/n): ").strip())
+        try:
+            return validate_yes_no_input(value)
+        except ValueError as exc:
+            print(f"{exc} Type 'back' to cancel.")
 
 
 # This loads active timetable data and prints it as a table
@@ -237,6 +241,90 @@ def resolve_duplicate_slots(error):
 
     print("Duplicate timetable entries were cleaned successfully.")
     return True
+
+
+# This guides the user through malformed stored timetable rows on startup
+# and returns whether the app can continue after those bad entries are fixed or removed.
+def resolve_invalid_timetable_entries(error):
+    try:
+        print("\nInvalid timetable entries were found in timetable.json.")
+
+        for issue_number, issue in enumerate(error.issues, start=1):
+            print(f"\nInvalid entry {issue_number} at position {issue['index']}:")
+            print(f"  Error: {issue['error']}")
+            print(f"  Stored data: {issue['entry']}")
+
+        if not prompt_yes_no("Do you want to repair or delete these invalid entries now?"):
+            print("Please fix the invalid timetable entries before continuing.")
+            return False
+
+        while True:
+            current_issues = error.issues
+            if not current_issues:
+                print("All invalid timetable entries were repaired successfully.")
+                return True
+
+            issue = current_issues[0]
+            print(f"\nWorking on invalid entry at position {issue['index']}:")
+            print(f"  Error: {issue['error']}")
+            print(f"  Stored data: {issue['entry']}")
+
+            action = prompt_required("Type 'edit' to repair or 'delete' to remove this entry").lower()
+            if action == "delete":
+                deleted_entry = delete_raw_timetable_entry(issue["index"])
+                print(f"Deleted invalid entry: {deleted_entry}")
+            elif action == "edit":
+                while True:
+                    entry_id = prompt_required("New entry ID")
+                    day = prompt_day("Day")
+                    start_time = prompt_time("Start time (HH:MM)")
+                    end_time = prompt_time("End time (HH:MM)")
+                    class_name = prompt_required("Class name")
+                    classroom_url = prompt_required("Classroom URL")
+
+                    try:
+                        validate_entry_id(entry_id)
+                        validate_time_range(start_time, end_time)
+                        build_validated_entry(
+                            entry_id,
+                            day,
+                            start_time,
+                            end_time,
+                            class_name,
+                            classroom_url,
+                        )
+                        repaired_entry = repair_timetable_entry(
+                            issue["index"],
+                            entry_id,
+                            day,
+                            start_time,
+                            end_time,
+                            class_name,
+                            classroom_url,
+                        )
+                        print(f"Repaired invalid entry: {repaired_entry['id']}")
+                        break
+                    except Exception as exc:
+                        print(f"Error: {exc}")
+            else:
+                print("Please enter either 'edit' or 'delete'.")
+                continue
+
+            try:
+                initialize_storage()
+                print("Invalid timetable entries were repaired successfully.")
+                return True
+            except InvalidTimetableEntriesError as exc:
+                error = exc
+                continue
+            except DuplicateTimeSlotError as exc:
+                return resolve_duplicate_slots(exc)
+            except Exception as exc:
+                print(f"Error: {exc}")
+                return False
+    except UserCancelledOperation as exc:
+        print(exc)
+        return False
 
 
 # This collects add-entry input, validates it step by step,
@@ -397,6 +485,9 @@ def handle_recycle_bin():
 def main():
     try:
         initialize_storage()
+    except InvalidTimetableEntriesError as exc:
+        if not resolve_invalid_timetable_entries(exc):
+            return
     except DuplicateTimeSlotError as exc:
         if not resolve_duplicate_slots(exc):
             return
@@ -433,6 +524,9 @@ def main():
                 print("Invalid choice. Please enter a number from 1 to 6.")
         except UserCancelledOperation as exc:
             print(exc)
+        except InvalidTimetableEntriesError as exc:
+            if not resolve_invalid_timetable_entries(exc):
+                break
         except DuplicateTimeSlotError as exc:
             resolve_duplicate_slots(exc)
         except Exception as exc:

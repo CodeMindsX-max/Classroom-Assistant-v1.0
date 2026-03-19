@@ -116,9 +116,37 @@ with tempfile.TemporaryDirectory() as temp_dir:
         recycle_loaded = tm.load_recycle_bin()
         expect_equal("load_recycle_bin empty data", recycle_loaded, [])
 
+        expect_equal("validate_required_text valid", tm.validate_required_text(" Name ", "name"), "Name")
+        expect_equal("validate_optional_text blank", tm.validate_optional_text("   "), "")
+        expect_equal("validate_day_input valid", tm.validate_day_input("monday"), "Monday")
+        expect_equal("validate_time_input valid", tm.validate_time_input("09:30", "start_time"), "09:30")
+        expect_equal("validate_yes_no_input yes", tm.validate_yes_no_input("Yes"), True)
+        expect_equal("validate_yes_no_input no", tm.validate_yes_no_input("n"), False)
+
         start, end = tm.validate_time_range("10:00", "12:00")
         expect_equal("validate_time_range valid start", start, "10:00")
         expect_equal("validate_time_range valid end", end, "12:00")
+
+        expect_exception(
+            "validate_required_text empty",
+            lambda: tm.validate_required_text("   ", "name"),
+            ValueError,
+            "cannot be empty",
+        )
+
+        expect_exception(
+            "validate_optional_text invalid type",
+            lambda: tm.validate_optional_text(None),
+            ValueError,
+            "must be a string",
+        )
+
+        expect_exception(
+            "validate_yes_no_input invalid",
+            lambda: tm.validate_yes_no_input("maybe"),
+            ValueError,
+            "Please enter y or n",
+        )
 
         tm.clear_storage_cache()
         read_counts = {"timetable": 0, "recycle": 0}
@@ -167,6 +195,13 @@ with tempfile.TemporaryDirectory() as temp_dir:
         expect_exception(
             "validate_time_range invalid format",
             lambda: tm.validate_time_range("9am", "10:00"),
+            ValueError,
+            "HH:MM",
+        )
+
+        expect_exception(
+            "validate_time_input requires zero padded hour",
+            lambda: tm.validate_time_input("9:00", "start_time"),
             ValueError,
             "HH:MM",
         )
@@ -442,6 +477,55 @@ with tempfile.TemporaryDirectory() as temp_dir:
             timetable_path,
             [
                 {
+                    "id": "mon_1",
+                    "day": "Monday",
+                    "start_time": "9:00",
+                    "end_time": "10:00",
+                    "class_name": "Bad Time",
+                    "classroom_url": "https://example.com/bad-time",
+                }
+            ],
+        )
+        issues = tm.inspect_timetable_entry_issues()
+        expect_equal("inspect_timetable_entry_issues finds invalid row", len(issues), 1)
+        if "HH:MM" not in issues[0]["error"]:
+            raise AssertionError("inspect_timetable_entry_issues missing invalid time detail")
+        print("PASS: inspect_timetable_entry_issues error detail")
+
+        repaired = tm.repair_timetable_entry(
+            0,
+            "mon_1",
+            "Monday",
+            "09:00",
+            "10:00",
+            "Fixed Time",
+            "https://example.com/fixed-time",
+        )
+        expect_equal("repair_timetable_entry fixed id", repaired["id"], "mon_1")
+        expect_equal("repair_timetable_entry fixed time", repaired["start_time"], "09:00")
+        expect_equal("repair_timetable_entry makes file loadable", len(tm.load_timetable()), 1)
+
+        write_json(
+            timetable_path,
+            [
+                {
+                    "id": "bad",
+                    "day": "Funday",
+                    "start_time": "09:00",
+                    "end_time": "10:00",
+                    "class_name": "Broken",
+                    "classroom_url": "https://example.com/broken",
+                }
+            ],
+        )
+        deleted_raw_entry = tm.delete_raw_timetable_entry(0)
+        expect_equal("delete_raw_timetable_entry returns removed raw id", deleted_raw_entry["id"], "bad")
+        expect_equal("delete_raw_timetable_entry empties file", len(tm.load_timetable()), 0)
+
+        write_json(
+            timetable_path,
+            [
+                {
                     "id": "bad_1",
                     "day": "Monday",
                     "start_time": "08:00",
@@ -640,13 +724,13 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
         value, output = run_with_inputs(lambda: main.prompt_day("Day"), ["funday", "tuesday"])
         expect_equal("main prompt_day retries invalid input", value, "Tuesday")
-        if "Invalid day." not in output:
+        if "day must be a valid day name" not in output:
             raise AssertionError("main prompt_day invalid message missing")
         print("PASS: main prompt_day invalid message")
 
         value, output = run_with_inputs(lambda: main.prompt_time("Time"), ["wrong", "09:30"])
         expect_equal("main prompt_time retries invalid input", value, "09:30")
-        if "Invalid time." not in output:
+        if "must be in HH:MM format" not in output:
             raise AssertionError("main prompt_time invalid message missing")
         print("PASS: main prompt_time invalid message")
 

@@ -11,6 +11,7 @@ RECYCLE_BIN_FILE = "recycle_bin.json"
 VALID_FIELDS = {"day", "start_time", "end_time", "class_name", "classroom_url"}
 RECYCLE_ID_PATTERN = re.compile(r"^bin_\d+$")
 ENTRY_ID_PATTERN = re.compile(r"^[a-z]{3}_\d+$")
+TIME_PATTERN = re.compile(r"^\d{2}:\d{2}$")
 VALID_DAYS = {
     "Monday",
     "Tuesday",
@@ -20,6 +21,8 @@ VALID_DAYS = {
     "Saturday",
     "Sunday",
 }
+VALID_YES_VALUES = {"y", "yes"}
+VALID_NO_VALUES = {"n", "no"}
 
 
 class TimetableError(Exception):
@@ -50,6 +53,19 @@ class DuplicateTimeSlotError(TimetableConflictError):
         super().__init__("Duplicate timetable slots found in stored data.")
 
 
+class InvalidTimetableEntriesError(TimetableValidationError):
+    """Raised when stored timetable entries are malformed and need repair."""
+
+    def __init__(self, issues):
+        self.issues = issues
+        issue_count = len(issues)
+        first_error = issues[0]["error"] if issues else "Unknown validation error."
+        super().__init__(
+            f"Invalid timetable entries found in stored data ({issue_count} issue(s)). "
+            f"First issue: {first_error}"
+        )
+
+
 TIMETABLE_CACHE = None
 RECYCLE_BIN_CACHE = None
 
@@ -67,6 +83,20 @@ def _validate_text(value, field_name):
     return cleaned_value
 
 
+# This validates required user text input and returns the cleaned value
+# so both CLI and future GUI screens can share one required-field rule.
+def validate_required_text(value, field_name):
+    return _validate_text(value, field_name)
+
+
+# This validates optional text input and returns a cleaned value or an empty string
+# so edit screens can keep old values when the user leaves a field blank.
+def validate_optional_text(value):
+    if not isinstance(value, str):
+        raise TimetableValidationError("Optional input must be a string.")
+    return value.strip()
+
+
 # This keeps recycle bin ids in one safe pattern and returns the cleaned id
 # so restore and permanent delete work only with valid recycle references.
 def _validate_recycle_id(value):
@@ -76,6 +106,12 @@ def _validate_recycle_id(value):
             "recycle_id must be in the format 'bin_<number>', for example 'bin_1'."
         )
     return cleaned_value
+
+
+# This validates recycle-bin ids for UI or API input and returns the cleaned id
+# so restore and permanent delete use one shared rule everywhere.
+def validate_recycle_id(value):
+    return _validate_recycle_id(value)
 
 
 # This validates one timetable entry id and returns the cleaned id
@@ -89,10 +125,19 @@ def _validate_entry_id(value):
     return cleaned_value
 
 
+# This validates timetable entry ids for UI or API input and returns the cleaned id
+# so edit and delete screens use the same strong id rule as stored data.
+def validate_entry_id(value):
+    return _validate_entry_id(value)
+
+
 # This validates one time value and returns the cleaned HH:MM string
 # so all timetable operations work with one consistent time format.
 def _validate_time(value, field_name):
     cleaned_value = _validate_text(value, field_name)
+
+    if not TIME_PATTERN.fullmatch(cleaned_value):
+        raise TimetableValidationError(f"{field_name} must be in HH:MM format.")
 
     try:
         datetime.strptime(cleaned_value, "%H:%M")
@@ -100,6 +145,12 @@ def _validate_time(value, field_name):
         raise TimetableValidationError(f"{field_name} must be in HH:MM format.") from exc
 
     return cleaned_value
+
+
+# This validates one time value for user-facing input and returns the cleaned result
+# so CLI and GUI forms share the same HH:MM format enforcement.
+def validate_time_input(value, field_name="time"):
+    return _validate_time(value, field_name)
 
 
 # This validates the entered day name and returns a normalized day
@@ -110,6 +161,23 @@ def _validate_day(value):
         valid_days_text = ", ".join(sorted(VALID_DAYS))
         raise TimetableValidationError(f"day must be a valid day name: {valid_days_text}.")
     return cleaned_value
+
+
+# This validates one weekday for user-facing input and returns the normalized day
+# so every interface uses the same allowed weekday names.
+def validate_day_input(value):
+    return _validate_day(value)
+
+
+# This validates yes/no style answers and returns a boolean result
+# so confirmations can share one parser across CLI and future GUI adapters.
+def validate_yes_no_input(value):
+    cleaned_value = _validate_text(value, "confirmation").lower()
+    if cleaned_value in VALID_YES_VALUES:
+        return True
+    if cleaned_value in VALID_NO_VALUES:
+        return False
+    raise TimetableValidationError("Please enter y or n.")
 
 
 # This builds one reusable slot key for lookup and conflict checks
@@ -198,6 +266,21 @@ def _validate_entry(entry):
         "class_name": validated_name,
         "classroom_url": validated_url,
     }
+
+
+# This validates a full entry payload and returns the clean entry dictionary
+# so CLI and future GUI repair flows can build one trusted timetable record.
+def build_validated_entry(entry_id, day, start_time, end_time, class_name, classroom_url):
+    return _validate_entry(
+        {
+            "id": entry_id,
+            "day": day,
+            "start_time": start_time,
+            "end_time": end_time,
+            "class_name": class_name,
+            "classroom_url": classroom_url,
+        }
+    )
 
 
 # This validates one recycle-bin record and returns a clean copy
@@ -360,6 +443,81 @@ def _atomic_write_json_list_file(file_path, data):
                 pass
 
 
+# This reads raw timetable JSON rows without full validation
+# so startup repair flows can inspect and fix malformed stored entries safely.
+def load_raw_timetable():
+    data = _read_timetable_file()
+    if not isinstance(data, list):
+        raise TimetableValidationError(f"{TIMETABLE_FILE} must contain a list of entries.")
+    return data
+
+
+# This inspects raw timetable rows and returns a list of invalid-entry issues
+# so the app can guide the user to edit or delete broken stored data at startup.
+def _inspect_timetable_entry_issues_from_data(raw_timetable):
+    issues = []
+
+    for index, entry in enumerate(raw_timetable):
+        try:
+            _validate_entry(entry)
+        except TimetableError as exc:
+            issues.append(
+                {
+                    "index": index,
+                    "entry": copy.deepcopy(entry),
+                    "error": str(exc),
+                }
+            )
+
+    return issues
+
+
+# This inspects raw timetable rows and returns a list of invalid-entry issues
+# so the app can guide the user to edit or delete broken stored data at startup.
+def inspect_timetable_entry_issues():
+    return _inspect_timetable_entry_issues_from_data(load_raw_timetable())
+
+
+# This removes one raw timetable entry by index and writes the remaining raw data back
+# so malformed stored rows can be deleted before normal validated loading resumes.
+def delete_raw_timetable_entry(index):
+    raw_timetable = load_raw_timetable()
+
+    if not isinstance(index, int):
+        raise TimetableValidationError("index must be an integer.")
+    if index < 0 or index >= len(raw_timetable):
+        raise TimetableNotFoundError(f"No raw timetable entry found at index {index}.")
+
+    deleted_entry = copy.deepcopy(raw_timetable.pop(index))
+    _atomic_write_json_list_file(TIMETABLE_FILE, raw_timetable)
+    clear_storage_cache()
+    return deleted_entry
+
+
+# This replaces one raw timetable entry with a validated entry and writes raw data back
+# so malformed stored rows can be repaired even before the whole file is clean.
+def repair_timetable_entry(index, entry_id, day, start_time, end_time, class_name, classroom_url):
+    raw_timetable = load_raw_timetable()
+
+    if not isinstance(index, int):
+        raise TimetableValidationError("index must be an integer.")
+    if index < 0 or index >= len(raw_timetable):
+        raise TimetableNotFoundError(f"No raw timetable entry found at index {index}.")
+
+    validated_entry = build_validated_entry(
+        entry_id,
+        day,
+        start_time,
+        end_time,
+        class_name,
+        classroom_url,
+    )
+    raw_timetable[index] = validated_entry
+    _atomic_write_json_list_file(TIMETABLE_FILE, raw_timetable)
+    clear_storage_cache()
+    return copy.deepcopy(validated_entry)
+
+
 # This validates every saved timetable record and returns a clean list copy
 # so load and save only work with trusted timetable data.
 def _validate_timetable_entries(data, allow_duplicate_slots=False):
@@ -401,8 +559,12 @@ def load_timetable(allow_duplicate_slots=False):
     global TIMETABLE_CACHE
 
     if TIMETABLE_CACHE is None:
+        raw_timetable = _read_timetable_file()
+        issues = _inspect_timetable_entry_issues_from_data(raw_timetable)
+        if issues:
+            raise InvalidTimetableEntriesError(issues)
         TIMETABLE_CACHE = _validate_timetable_entries(
-            _read_timetable_file(),
+            raw_timetable,
             allow_duplicate_slots=allow_duplicate_slots,
         )
 
