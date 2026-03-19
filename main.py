@@ -1,3 +1,4 @@
+from app_logger_manager import get_app_logger, log_error, log_event, log_info, log_warning, shutdown_logging
 from timetable_manager import (
     DuplicateTimeSlotError,
     InvalidTimetableEntriesError,
@@ -31,7 +32,9 @@ DAY_ORDER = [
     "Saturday",
     "Sunday",
 ]
+DAY_ORDER_MAP = {day: index for index, day in enumerate(DAY_ORDER)}
 CANCEL_KEYWORDS = {"back", "cancel", "menu"}
+LOGGER = get_app_logger("main")
 
 
 class UserCancelledOperation(Exception):
@@ -137,11 +140,10 @@ def show_timetable():
 # This sorts timetable entries by weekday and start time and returns that list
 # so every timetable display stays consistent and easy to read.
 def _sorted_timetable_entries(timetable):
-    day_order_map = {day: index for index, day in enumerate(DAY_ORDER)}
     return sorted(
         timetable,
         key=lambda entry: (
-            day_order_map.get(entry["day"], len(DAY_ORDER)),
+            DAY_ORDER_MAP.get(entry["day"], len(DAY_ORDER)),
             entry["start_time"],
             entry["id"],
         ),
@@ -203,6 +205,14 @@ def show_recycle_bin():
 # and returns whether the app can continue normal work afterward.
 def resolve_duplicate_slots(error):
     while True:
+        log_warning(
+            LOGGER,
+            "Startup duplicate-slot repair is required.",
+            what="Detected duplicate timetable slots during startup validation.",
+            where="main.resolve_duplicate_slots",
+            why="Stored timetable data contains conflicting slots that block safe startup.",
+            context={"duplicate_group_count": len(error.duplicates)},
+        )
         print("\nDuplicate timetable slots were found in timetable.json.")
 
         for group_number, duplicate_group in enumerate(error.duplicates, start=1):
@@ -218,6 +228,13 @@ def resolve_duplicate_slots(error):
                 )
 
         if not prompt_yes_no("Do you want to delete duplicate entries now?"):
+            log_warning(
+                LOGGER,
+                "User deferred duplicate-slot cleanup.",
+                what="Startup duplicate-slot repair was declined for this loop iteration.",
+                where="main.resolve_duplicate_slots",
+                why="The user chose not to repair blocking duplicate timetable data yet.",
+            )
             print("This data must be repaired before the program can continue.")
             continue
 
@@ -239,6 +256,13 @@ def resolve_duplicate_slots(error):
                         print(f"Deleted duplicate entry: {entry['id']}")
                 break
 
+        log_event(
+            LOGGER,
+            "Startup duplicate-slot cleanup completed.",
+            what="Removed blocking duplicate timetable entries during startup repair.",
+            where="main.resolve_duplicate_slots",
+            why="The user resolved duplicate timetable data so normal startup could continue.",
+        )
         print("Duplicate timetable entries were cleaned successfully.")
         return True
 
@@ -248,6 +272,14 @@ def resolve_duplicate_slots(error):
 def resolve_invalid_timetable_entries(error):
     try:
         while True:
+            log_warning(
+                LOGGER,
+                "Startup invalid-entry repair is required.",
+                what="Detected invalid stored timetable entries during startup validation.",
+                where="main.resolve_invalid_timetable_entries",
+                why="Stored timetable rows failed manager validation and must be repaired or removed.",
+                context={"issue_count": len(error.issues)},
+            )
             print("\nInvalid timetable entries were found in timetable.json.")
 
             current_issues = error.issues
@@ -261,6 +293,13 @@ def resolve_invalid_timetable_entries(error):
                 print(f"  Stored data: {listed_issue['entry']}")
 
             if not prompt_yes_no("Do you want to repair or delete these invalid entries now?"):
+                log_warning(
+                    LOGGER,
+                    "User deferred invalid-entry cleanup.",
+                    what="Startup invalid-entry repair was declined for this loop iteration.",
+                    where="main.resolve_invalid_timetable_entries",
+                    why="The user chose not to repair blocking invalid timetable data yet.",
+                )
                 print("This data must be repaired before the program can continue.")
                 continue
 
@@ -274,6 +313,14 @@ def resolve_invalid_timetable_entries(error):
             action = prompt_required("Type 'edit' to repair or 'delete' to remove this entry").lower()
             if action == "delete":
                 deleted_entry = delete_raw_timetable_entry(issue["index"])
+                log_event(
+                    LOGGER,
+                    "Deleted one invalid startup entry.",
+                    what="Removed a malformed timetable row during startup repair.",
+                    where="main.resolve_invalid_timetable_entries",
+                    why="The user chose deletion instead of editing for a blocking invalid row.",
+                    context={"index": issue["index"], "entry_id": deleted_entry.get("id")},
+                )
                 print(f"Deleted invalid entry: {deleted_entry}")
             elif action == "edit":
                 while True:
@@ -306,9 +353,25 @@ def resolve_invalid_timetable_entries(error):
                             class_name,
                             classroom_url,
                         )
+                        log_event(
+                            LOGGER,
+                            "Repaired one invalid startup entry.",
+                            what="Updated a malformed timetable row during startup repair.",
+                            where="main.resolve_invalid_timetable_entries",
+                            why="The user supplied corrected values for the invalid stored row.",
+                            context={"index": issue["index"], "entry_id": repaired_entry["id"], "fields": sorted(invalid_fields)},
+                        )
                         print(f"Repaired invalid entry: {repaired_entry['id']}")
                         break
                     except Exception as exc:
+                        log_warning(
+                            LOGGER,
+                            "Startup entry repair attempt failed.",
+                            what="A startup repair submission was rejected.",
+                            where="main.resolve_invalid_timetable_entries",
+                            why=str(exc),
+                            context={"index": issue["index"], "fields": sorted(invalid_fields)},
+                        )
                         print(f"Error: {exc}")
             else:
                 print("Please enter either 'edit' or 'delete'.")
@@ -316,6 +379,13 @@ def resolve_invalid_timetable_entries(error):
 
             try:
                 initialize_storage()
+                log_event(
+                    LOGGER,
+                    "Startup invalid-entry cleanup completed.",
+                    what="Resolved blocking invalid timetable data during startup repair.",
+                    where="main.resolve_invalid_timetable_entries",
+                    why="The stored timetable became valid again and startup can continue.",
+                )
                 print("Invalid timetable entries were repaired successfully.")
                 return True
             except InvalidTimetableEntriesError as exc:
@@ -324,9 +394,24 @@ def resolve_invalid_timetable_entries(error):
             except DuplicateTimeSlotError as exc:
                 return resolve_duplicate_slots(exc)
             except Exception as exc:
+                log_error(
+                    LOGGER,
+                    "Startup repair failed during reinitialization.",
+                    what="Storage reinitialization failed after a startup repair attempt.",
+                    where="main.resolve_invalid_timetable_entries",
+                    why=str(exc),
+                    exc_info=True,
+                )
                 print(f"Error: {exc}")
                 return False
     except UserCancelledOperation as exc:
+        log_info(
+            LOGGER,
+            "User cancelled startup repair flow.",
+            what="Startup repair returned to the caller because the user cancelled the interaction.",
+            where="main.resolve_invalid_timetable_entries",
+            why=str(exc),
+        )
         print(exc)
         return False
 
@@ -334,6 +419,7 @@ def resolve_invalid_timetable_entries(error):
 # This collects add-entry input, validates it step by step,
 # and creates a new timetable entry through the manager layer.
 def handle_add():
+    log_info(LOGGER, "Entered add-entry flow.", what="Opened the add-entry CLI flow.", where="main.handle_add", why="The user selected the add-entry feature.")
     print("\nAdd Entry. Type 'back' at any prompt to return to the main menu.")
     day = prompt_day("Day")
     while True:
@@ -355,6 +441,7 @@ def handle_add():
 # This collects edit input, keeps unchanged values when fields are blank,
 # and returns control after updating the selected timetable entry.
 def handle_edit():
+    log_info(LOGGER, "Entered edit-entry flow.", what="Opened the edit-entry CLI flow.", where="main.handle_edit", why="The user selected the edit-entry feature.")
     print("\nEdit Entry. Type 'back' at any prompt to return to the main menu.")
     entry_id = prompt_required("Entry ID to edit")
     current_entry = get_entry_by_id(entry_id)
@@ -397,6 +484,7 @@ def handle_edit():
         updates["classroom_url"] = classroom_url
 
     if not updates:
+        log_info(LOGGER, "Edit-entry flow ended with no changes.", what="The edit-entry CLI flow received no field updates.", where="main.handle_edit", why="The user left every editable field blank.")
         print("No changes entered.")
         return
 
@@ -407,6 +495,7 @@ def handle_edit():
 # This shows the chosen class, asks for confirmation,
 # and moves the entry into the recycle bin if approved.
 def handle_delete():
+    log_info(LOGGER, "Entered delete-entry flow.", what="Opened the delete-entry CLI flow.", where="main.handle_delete", why="The user selected the delete-entry feature.")
     print("\nDelete Entry. Type 'back' at any prompt to return to the main menu.")
     entry_id = prompt_required("Entry ID to delete")
     entry = get_entry_by_id(entry_id)
@@ -425,6 +514,7 @@ def handle_delete():
     )
 
     if not prompt_yes_no("Do you want to move this entry to the recycle bin"):
+        log_info(LOGGER, "Deletion was cancelled by the user.", what="The delete-entry CLI flow was confirmed as no-op.", where="main.handle_delete", why="The user rejected the delete confirmation prompt.", context={"entry_id": entry["id"]})
         print("Deletion cancelled. Entry was not removed.")
         return
 
@@ -438,6 +528,7 @@ def handle_delete():
 # This runs the recycle-bin submenu for viewing, restoring,
 # and permanently deleting archived entries.
 def handle_recycle_bin():
+    log_info(LOGGER, "Entered recycle-bin flow.", what="Opened the recycle-bin CLI flow.", where="main.handle_recycle_bin", why="The user selected the recycle-bin feature.")
     print("\nRecycle Bin. Type 'back' at any prompt to return to the main menu.")
 
     while True:
@@ -470,6 +561,7 @@ def handle_recycle_bin():
             if not prompt_yes_no(
                 f"Are you sure you want to permanently delete {record['entry']['id']} from the recycle bin"
             ):
+                log_info(LOGGER, "Permanent recycle-bin deletion was cancelled.", what="The recycle-bin CLI flow kept a record after confirmation was declined.", where="main.handle_recycle_bin", why="The user rejected the permanent deletion confirmation prompt.", context={"recycle_id": recycle_id, "entry_id": record["entry"]["id"]})
                 print("Permanent deletion cancelled.")
                 continue
             deleted_record = permanently_delete_recycle_entry(recycle_id)
@@ -489,14 +581,18 @@ def handle_recycle_bin():
 def main():
     try:
         try:
+            log_info(LOGGER, "CLI startup started.", what="Application startup validation began.", where="main.main", why="The timetable manager program was launched.")
             initialize_storage()
         except InvalidTimetableEntriesError as exc:
+            log_warning(LOGGER, "Startup found invalid stored timetable entries.", what="Startup validation blocked execution because invalid timetable rows were found.", where="main.main", why=str(exc), context={"issue_count": len(exc.issues)})
             if not resolve_invalid_timetable_entries(exc):
                 return
         except DuplicateTimeSlotError as exc:
+            log_warning(LOGGER, "Startup found duplicate timetable slots.", what="Startup validation blocked execution because duplicate timetable slots were found.", where="main.main", why=str(exc), context={"duplicate_group_count": len(exc.duplicates)})
             if not resolve_duplicate_slots(exc):
                 return
         except Exception as exc:
+            log_error(LOGGER, "Startup failed unexpectedly.", what="Application startup stopped because initialization raised an unexpected exception.", where="main.main", why=str(exc), exc_info=True)
             print(f"Error: {exc}")
             return
 
@@ -513,31 +609,43 @@ def main():
 
             try:
                 if choice == "1":
+                    log_info(LOGGER, "User selected show timetable.", what="CLI menu routed to the timetable display feature.", where="main.main", why="The user chose menu option 1.")
                     show_timetable()
                 elif choice == "2":
+                    log_info(LOGGER, "User selected add entry.", what="CLI menu routed to the add-entry feature.", where="main.main", why="The user chose menu option 2.")
                     handle_add()
                 elif choice == "3":
+                    log_info(LOGGER, "User selected edit entry.", what="CLI menu routed to the edit-entry feature.", where="main.main", why="The user chose menu option 3.")
                     handle_edit()
                 elif choice == "4":
+                    log_info(LOGGER, "User selected delete entry.", what="CLI menu routed to the delete-entry feature.", where="main.main", why="The user chose menu option 4.")
                     handle_delete()
                 elif choice == "5":
+                    log_info(LOGGER, "User selected recycle bin.", what="CLI menu routed to the recycle-bin feature.", where="main.main", why="The user chose menu option 5.")
                     handle_recycle_bin()
                 elif choice == "6":
+                    log_info(LOGGER, "User selected exit.", what="CLI menu started graceful shutdown.", where="main.main", why="The user chose menu option 6.")
                     print("Goodbye.")
                     break
                 else:
+                    log_warning(LOGGER, "User entered an invalid menu choice.", what="CLI menu rejected an unsupported option.", where="main.main", why="The entered menu value did not match any supported feature.", context={"choice": choice})
                     print("Invalid choice. Please enter a number from 1 to 6.")
             except UserCancelledOperation as exc:
+                log_info(LOGGER, "User cancelled an in-progress CLI action.", what="A feature flow returned to the menu because the user used a cancel keyword.", where="main.main", why=str(exc))
                 print(exc)
             except InvalidTimetableEntriesError as exc:
+                log_warning(LOGGER, "An action surfaced invalid stored timetable data.", what="Runtime validation found invalid timetable rows and blocked the current operation.", where="main.main", why=str(exc), context={"issue_count": len(exc.issues)})
                 if not resolve_invalid_timetable_entries(exc):
                     break
             except DuplicateTimeSlotError as exc:
+                log_warning(LOGGER, "An action surfaced duplicate timetable slots.", what="Runtime validation found duplicate timetable slots and blocked the current operation.", where="main.main", why=str(exc), context={"duplicate_group_count": len(exc.duplicates)})
                 resolve_duplicate_slots(exc)
             except Exception as exc:
+                log_error(LOGGER, "A CLI action failed unexpectedly.", what="A runtime exception escaped the current menu action.", where="main.main", why=str(exc), exc_info=True)
                 print(f"Error: {exc}")
     finally:
         shutdown_storage()
+        shutdown_logging()
 
 
 if __name__ == "__main__":

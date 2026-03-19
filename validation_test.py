@@ -7,6 +7,7 @@ import traceback
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
+import app_logger_manager as alm
 import main
 import timetable_manager as tm
 
@@ -94,6 +95,8 @@ def print_validation_story():
     print("- Add and edit validation proved that duplicate slots, bad days, and bad fields are blocked safely.")
     print("- Delete, recycle bin, restore, and permanent delete checks proved that recovery flows are working.")
     print("- Cache checks proved that repeated operations reuse loaded data instead of rereading the JSON files.")
+    print("- Index-cache checks proved that repeated lookups reuse in-memory maps instead of rescanning full lists.")
+    print("- Structured logging checks proved that JSON logs are written safely and sensitive URL fields are redacted.")
     print("- Stored JSON corruption checks proved that invalid timetable or recycle-bin files are detected early.")
     print("- Main-file prompt checks proved that menu helpers guide the user, retry bad input, and respect cancel words.")
     print("- Because every test ran on temporary files, the real timetable and recycle bin stayed untouched.")
@@ -102,8 +105,10 @@ def print_validation_story():
 with tempfile.TemporaryDirectory() as temp_dir:
     timetable_path = os.path.join(temp_dir, "timetable.json")
     recycle_bin_path = os.path.join(temp_dir, "recycle_bin.json")
+    log_dir = os.path.join(temp_dir, "logs")
     write_json(timetable_path, BASE_TIMETABLE)
     write_json(recycle_bin_path, [])
+    alm.configure_logging(log_dir=log_dir, force=True)
 
     original_timetable_file = tm.TIMETABLE_FILE
     original_recycle_file = tm.RECYCLE_BIN_FILE
@@ -121,9 +126,43 @@ with tempfile.TemporaryDirectory() as temp_dir:
         expect_equal("validate_optional_text blank", tm.validate_optional_text("   "), "")
         expect_equal("validate_day_input valid", tm.validate_day_input("monday"), "Monday")
         expect_equal("validate_time_input valid", tm.validate_time_input("09:30", "start_time"), "09:30")
+        expect_equal("validate_time_input max boundary", tm.validate_time_input("23:59", "end_time"), "23:59")
         expect_equal("validate_yes_no_input yes", tm.validate_yes_no_input("Yes"), True)
         expect_equal("validate_yes_no_input no", tm.validate_yes_no_input("n"), False)
         expect_equal("shutdown event initially clear", tm.get_shutdown_event().is_set(), False)
+
+        test_logger = alm.get_app_logger("validation_test")
+        alm.log_event(
+            test_logger,
+            "Structured logging smoke test.",
+            what="Recorded a JSON log event for validation testing.",
+            where="validation_test",
+            why="The suite is proving that structured logging is configured correctly.",
+            context={"entry_id": "mon_1", "classroom_url": "https://secret.example.com/class"},
+        )
+        alm.flush_logging()
+        log_path = alm.get_log_file_path()
+        if not os.path.exists(log_path):
+            raise AssertionError("structured logger did not create a log file")
+        print("PASS: logger created log file")
+
+        with open(log_path, "r", encoding="utf-8") as log_file:
+            log_lines = [line.strip() for line in log_file if line.strip()]
+
+        if not log_lines:
+            raise AssertionError("structured logger did not write any log records")
+
+        latest_log = json.loads(log_lines[-1])
+        for required_key in ["timestamp", "when", "where", "what", "why", "severity", "level"]:
+            if required_key not in latest_log:
+                raise AssertionError(f"structured logger missing key: {required_key}")
+        print("PASS: logger writes required JSON fields")
+
+        expect_equal("logger uses custom EVENT level", latest_log["level"], "EVENT")
+        expect_equal("logger redacts sensitive context", latest_log["context"]["classroom_url"], "[REDACTED]")
+        if "https://secret.example.com/class" in "\n".join(log_lines):
+            raise AssertionError("structured logger leaked a sensitive URL into the log file")
+        print("PASS: logger keeps URLs redacted")
 
         start, end = tm.validate_time_range("10:00", "12:00")
         expect_equal("validate_time_range valid start", start, "10:00")
@@ -180,6 +219,48 @@ with tempfile.TemporaryDirectory() as temp_dir:
         write_json(timetable_path, BASE_TIMETABLE)
         write_json(recycle_bin_path, [])
 
+        write_json(
+            recycle_bin_path,
+            [
+                {
+                    "recycle_id": "bin_1",
+                    "deleted_at": "2026-03-18T10:00:00",
+                    "entry": BASE_TIMETABLE[0],
+                }
+            ],
+        )
+
+        tm.clear_storage_cache()
+        index_counts = {"timetable": 0, "recycle": 0}
+        original_build_timetable_indexes = tm._build_timetable_indexes
+        original_build_recycle_index_map = tm._build_recycle_index_map
+
+        def counted_build_timetable_indexes(timetable):
+            index_counts["timetable"] += 1
+            return original_build_timetable_indexes(timetable)
+
+        def counted_build_recycle_index_map(recycle_bin):
+            index_counts["recycle"] += 1
+            return original_build_recycle_index_map(recycle_bin)
+
+        tm._build_timetable_indexes = counted_build_timetable_indexes
+        tm._build_recycle_index_map = counted_build_recycle_index_map
+        try:
+            tm.initialize_storage()
+            index_counts["timetable"] = 0
+            index_counts["recycle"] = 0
+            tm.get_entry_by_id("mon_1")
+            tm.get_entry_by_id("tue_1")
+            tm.get_recycle_record_by_id("bin_1")
+            expect_equal("cached timetable lookups reuse indexes", index_counts["timetable"], 0)
+            expect_equal("cached recycle lookups reuse indexes", index_counts["recycle"], 0)
+        finally:
+            tm._build_timetable_indexes = original_build_timetable_indexes
+            tm._build_recycle_index_map = original_build_recycle_index_map
+
+        write_json(timetable_path, BASE_TIMETABLE)
+        write_json(recycle_bin_path, [])
+
         expect_exception(
             "validate_time_range same time",
             lambda: tm.validate_time_range("09:00", "09:00"),
@@ -204,6 +285,13 @@ with tempfile.TemporaryDirectory() as temp_dir:
         expect_exception(
             "validate_time_input requires zero padded hour",
             lambda: tm.validate_time_input("9:00", "start_time"),
+            ValueError,
+            "HH:MM",
+        )
+
+        expect_exception(
+            "validate_time_input rejects hour overflow",
+            lambda: tm.validate_time_input("24:00", "start_time"),
             ValueError,
             "HH:MM",
         )
@@ -923,6 +1011,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         traceback.print_exc()
         raise
     finally:
+        alm.shutdown_logging()
         tm.clear_storage_cache()
         tm.TIMETABLE_FILE = original_timetable_file
         tm.RECYCLE_BIN_FILE = original_recycle_file
