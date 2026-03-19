@@ -11,6 +11,7 @@ from timetable_manager import (
     initialize_storage,
     load_timetable,
     load_recycle_bin,
+    clear_recycle_bin,
     permanently_delete_recycle_entry,
     repair_timetable_entry,
     restore_entry,
@@ -213,7 +214,7 @@ def resolve_duplicate_slots(error):
             why="Stored timetable data contains conflicting slots that block safe startup.",
             context={"duplicate_group_count": len(error.duplicates)},
         )
-        print("\nDuplicate timetable slots were found in timetable.json.")
+        print("\nDuplicate timetable slots were found in SQLite storage.")
 
         for group_number, duplicate_group in enumerate(error.duplicates, start=1):
             first_entry = duplicate_group[0]
@@ -280,7 +281,7 @@ def resolve_invalid_timetable_entries(error):
                 why="Stored timetable rows failed manager validation and must be repaired or removed.",
                 context={"issue_count": len(error.issues)},
             )
-            print("\nInvalid timetable entries were found in timetable.json.")
+            print("\nInvalid timetable entries were found in SQLite storage.")
 
             current_issues = error.issues
             if not current_issues:
@@ -536,7 +537,8 @@ def handle_recycle_bin():
         print("1. Show recycle bin")
         print("2. Restore entry")
         print("3. Delete permanently")
-        print("4. Return to main menu")
+        print("4. Clear recycle bin")
+        print("5. Return to main menu")
 
         choice = _check_cancel(input("Choose an option: ").strip())
 
@@ -570,10 +572,23 @@ def handle_recycle_bin():
                 f"{deleted_record['recycle_id']}"
             )
         elif choice == "4":
+            if not show_recycle_bin():
+                continue
+            if not prompt_yes_no(
+                "Are you sure you want to permanently clear the entire recycle bin"
+            ):
+                log_info(LOGGER, "Recycle-bin clear was cancelled.", what="The recycle-bin CLI flow kept all archive records after full-clear confirmation was declined.", where="main.handle_recycle_bin", why="The user rejected the recycle-bin clear confirmation prompt.")
+                print("Recycle bin clear cancelled.")
+                continue
+            deleted_records = clear_recycle_bin()
+            print(
+                f"Permanently deleted all recycle bin entries: {len(deleted_records)} record(s)"
+            )
+        elif choice == "5":
             print("Returning to the main menu.")
             return
         else:
-            print("Invalid choice. Please enter a number from 1 to 4.")
+            print("Invalid choice. Please enter a number from 1 to 5.")
 
 
 # This is the main program loop that validates startup data,

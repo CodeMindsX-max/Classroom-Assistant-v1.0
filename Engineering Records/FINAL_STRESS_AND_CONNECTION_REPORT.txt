@@ -1,0 +1,176 @@
+Final Stress And Connection Model Report
+Date: 2026-03-20
+
+1. Main Rule Review: "Load Database Once"
+The request was to make sure the database is not repeatedly loaded in every function call.
+
+Important engineering note:
+For a future scheduler, the best design is not to load the whole timetable once into memory and keep using a stale snapshot.
+That would be risky because:
+- user edits could make the in-memory data outdated
+- scheduler decisions could be made on stale class data
+- concurrency correctness would become weaker
+
+So the safe and scalable design is:
+- keep SQLite as the single source of truth
+- keep reads real-time
+- avoid repeated connection open/close overhead
+
+2. What Was Changed
+The storage layer was upgraded to use persistent thread-local SQLite connections.
+
+New behavior:
+- one SQLite connection is created per thread
+- the same thread reuses its own connection
+- connections are not reopened for every single manager/database function call
+- connections are cleaned up during shutdown and database-path reset
+
+This means:
+- main thread can keep one live connection
+- future scheduler thread can keep its own live connection
+- both still read current SQLite data instead of stale memory copies
+
+This is the right compromise between:
+- performance
+- correctness
+- scheduler readiness
+- concurrency safety
+
+3. Why This Is Better Than Full In-Memory Loading
+If the whole DB were loaded once into memory:
+- CRUD changes from one part of the app might not be visible to another part immediately
+- background scheduler could act on old data
+- conflict handling would become harder
+- memory usage would grow unnecessarily as the app evolves
+
+With the current design:
+- SQLite remains the truth
+- reads are still current
+- connection overhead is reduced
+- memory usage stays lower
+
+4. Additional Code Improvements In This Pass
+4.1 database_manager.py
+- Added reusable helpers for entry-to-DB and recycle-record-to-DB mapping
+- Reduced repeated tuple-building logic
+- Added a timetable read index:
+  - idx_classes_day_start_entry
+- Added connection cache management:
+  - thread-local connection reuse by thread id
+  - full connection shutdown helper
+  - cleanup during database path changes and reset
+  - connection count helper for testing
+
+4.2 timetable_manager.py
+- Optimized clear_recycle_bin() to validate a direct recycle-bin snapshot
+- Reduced one unnecessary public load/clone roundtrip
+
+4.3 validation_test.py
+- Added same-thread connection reuse verification
+- Added thread-local connection count verification
+- Added bulk save roundtrip tests
+- Added full menu integration flow test
+
+4.4 fuzz_stress_test.py
+- Added a separate randomized stress and property-style test script
+- Covered sequential random operations
+- Covered concurrent random operations
+- Verified invariants remain valid after random activity
+
+5. Tests Performed
+5.1 Deterministic Regression Suite
+Command:
+- venv\Scripts\python.exe validation_test.py
+
+Result:
+- ALL TESTS PASSED
+
+Validated areas:
+- SQLite storage load/save
+- timetable validation
+- recycle-bin validation
+- strict time format
+- duration rules
+- overlap rules
+- exact duplicate rules
+- add/edit/delete/restore
+- bulk recycle-bin clear
+- malformed stored data repair
+- startup safety
+- CLI prompt behavior
+- integration flow through main menu
+- concurrency behavior
+- connection reuse behavior
+
+5.2 Property / Fuzz / Stress Suite
+Command:
+- venv\Scripts\python.exe fuzz_stress_test.py
+
+Result:
+- FUZZ STRESS TESTS PASSED
+
+Sequential fuzz result:
+- handled 338 expected exceptions safely
+
+Concurrent fuzz result:
+- handled 552 expected exceptions safely
+
+What this means:
+- randomized invalid inputs did not crash the program unexpectedly
+- randomized valid/invalid CRUD combinations stayed safe
+- concurrent random operations preserved storage invariants
+
+6. Safety Findings
+The current system now has strong protection in these areas:
+- invalid input validation
+- malformed stored data detection
+- duplicate timetable slot blocking
+- overlapping class blocking
+- recycle-bin misuse blocking
+- bulk recycle-bin clear safety
+- structured logging with redaction
+- per-thread connection reuse with shutdown cleanup
+- concurrency-safe manager locking
+
+7. Performance Findings
+Performance improved because:
+- connections are no longer created and destroyed on every operation
+- direct SQLite reads remain real-time
+- repeated storage mapping logic was reduced
+- an index now supports the most common ordered timetable reads
+- no full JSON file load/write loop exists anymore
+
+Memory/CPU impact:
+- lower connection churn
+- lower repeated setup cost
+- lower unnecessary object duplication in one recycle-bin path
+- still avoids large stale in-memory timetable caching
+
+8. Remaining Realistic Risks
+No real system is literally risk-free.
+Remaining realistic risks are:
+- multiple separate application processes writing to the same DB aggressively
+- external manual DB edits while the app is running
+- future scheduler logic adding new states/events without matching tests
+- very large data growth requiring more query-specific indexes later
+
+These are future growth considerations, not current breakages.
+
+9. Final Engineering Conclusion
+The database is now not being reopened for every operation in the old costly way.
+Instead, the program uses one persistent SQLite connection per thread, which is the better rule for this architecture.
+
+That gives you:
+- real-time data visibility
+- scheduler compatibility
+- lower overhead
+- safer concurrency behavior
+- better performance without stale-memory risk
+
+Final current status:
+- deterministic regression suite: passed
+- fuzz/property stress suite: passed
+- compile validation: passed
+- connection reuse model: improved and verified
+
+This is the strongest storage/concurrency state the project has had so far.

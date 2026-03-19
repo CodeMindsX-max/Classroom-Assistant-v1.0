@@ -27,6 +27,8 @@ dist/
 # =========================
 *.log
 logs/
+*.db
+*.sqlite3
 *.tmp
 *.temp
 

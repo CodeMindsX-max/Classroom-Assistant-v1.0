@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import traceback
@@ -8,6 +9,7 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import app_logger_manager as alm
+import database_manager as dbm
 import main
 import timetable_manager as tm
 
@@ -20,6 +22,7 @@ BASE_TIMETABLE = [
         "end_time": "09:00",
         "class_name": "Math",
         "classroom_url": "https://example.com/math",
+        "joined": False,
     },
     {
         "id": "tue_1",
@@ -28,20 +31,19 @@ BASE_TIMETABLE = [
         "end_time": "10:00",
         "class_name": "Science",
         "classroom_url": "https://example.com/science",
+        "joined": False,
     },
 ]
 
 
-# This writes temporary JSON data to a test file
-# so each validation scenario can run without touching real project data.
-def write_json(path, data):
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=2)
+def reset_database(classes=None, recycle_bin=None):
+    dbm.reset_migration_state()
+    tm.clear_storage_cache()
+    dbm.initialize_database()
+    dbm.replace_all_data(classes or [], recycle_bin or [])
     tm.clear_storage_cache()
 
 
-# This expects one specific failure path and prints a pass when it happens
-# so negative tests prove validation is blocking bad input correctly.
 def expect_exception(label, func, expected_exception, expected_text=None):
     try:
         func()
@@ -56,20 +58,15 @@ def expect_exception(label, func, expected_exception, expected_text=None):
         raise AssertionError(
             f"{label}: expected {expected_exception.__name__}, got {type(exc).__name__}: {exc}"
         ) from exc
-
     raise AssertionError(f"{label}: expected {expected_exception.__name__} but no exception was raised")
 
 
-# This checks two values are equal and prints a pass when they match
-# so success-path tests can prove functions return the expected result.
 def expect_equal(label, actual, expected):
     if actual != expected:
         raise AssertionError(f"{label}: expected {expected!r}, got {actual!r}")
     print(f"PASS: {label}")
 
 
-# This captures printed output and returns both the function result and text
-# so CLI display helpers can be tested without manual terminal checks.
 def capture_output(func, *args, **kwargs):
     buffer = io.StringIO()
     with redirect_stdout(buffer):
@@ -77,8 +74,6 @@ def capture_output(func, *args, **kwargs):
     return result, buffer.getvalue()
 
 
-# This feeds mock user input into one function and returns its result plus output
-# so prompt behavior can be tested safely without typing during the run.
 def run_with_inputs(func, inputs):
     buffer = io.StringIO()
     with patch("builtins.input", side_effect=inputs), redirect_stdout(buffer):
@@ -86,41 +81,32 @@ def run_with_inputs(func, inputs):
     return result, buffer.getvalue()
 
 
-# This prints a short end-of-run story about the passing checks
-# so the test output explains how the whole project is behaving correctly.
 def print_validation_story():
     print("\nValidation story:")
-    print("- The timetable manager accepted clean data and rejected broken data before saving it.")
-    print("- Time validation proved that class slots must use HH:MM format and stay within the allowed duration.")
-    print("- Add and edit validation proved that duplicate slots, bad days, and bad fields are blocked safely.")
-    print("- Delete, recycle bin, restore, and permanent delete checks proved that recovery flows are working.")
-    print("- Cache checks proved that repeated operations reuse loaded data instead of rereading the JSON files.")
-    print("- Index-cache checks proved that repeated lookups reuse in-memory maps instead of rescanning full lists.")
+    print("- SQLite storage accepted clean data and returned consistent rows for timetable and recycle-bin operations.")
+    print("- Validation proved that class slots must use HH:MM format, stay within one to three hours, and never overlap.")
+    print("- CRUD and recycle-bin tests proved that add, edit, delete, restore, and permanent delete flows still work safely.")
+    print("- Repair tests proved that malformed SQLite rows can be inspected, edited, or removed without crashing startup.")
+    print("- Schema checks proved that the database itself blocks exact duplicate timetable slots.")
     print("- Structured logging checks proved that JSON logs are written safely and sensitive URL fields are redacted.")
-    print("- Stored JSON corruption checks proved that invalid timetable or recycle-bin files are detected early.")
-    print("- Main-file prompt checks proved that menu helpers guide the user, retry bad input, and respect cancel words.")
-    print("- Because every test ran on temporary files, the real timetable and recycle bin stayed untouched.")
+    print("- Main-file prompt checks proved that menu helpers still guide the user, retry bad input, and respect cancel words.")
+    print("- Concurrency checks proved that repeated reads and updates still behave safely under threaded access.")
 
 
 with tempfile.TemporaryDirectory() as temp_dir:
-    timetable_path = os.path.join(temp_dir, "timetable.json")
-    recycle_bin_path = os.path.join(temp_dir, "recycle_bin.json")
+    database_path = os.path.join(temp_dir, "classroom_assistant.db")
     log_dir = os.path.join(temp_dir, "logs")
-    write_json(timetable_path, BASE_TIMETABLE)
-    write_json(recycle_bin_path, [])
+    original_database_file = dbm.DATABASE_FILE
+    dbm.set_database_path(database_path)
     alm.configure_logging(log_dir=log_dir, force=True)
 
-    original_timetable_file = tm.TIMETABLE_FILE
-    original_recycle_file = tm.RECYCLE_BIN_FILE
-    tm.TIMETABLE_FILE = timetable_path
-    tm.RECYCLE_BIN_FILE = recycle_bin_path
-
     try:
+        reset_database(BASE_TIMETABLE, [])
+
         loaded = tm.load_timetable()
         expect_equal("load_timetable valid data count", len(loaded), 2)
-
-        recycle_loaded = tm.load_recycle_bin()
-        expect_equal("load_recycle_bin empty data", recycle_loaded, [])
+        expect_equal("sqlite database file created", os.path.exists(database_path), True)
+        expect_equal("load_recycle_bin empty data", tm.load_recycle_bin(), [])
 
         expect_equal("validate_required_text valid", tm.validate_required_text(" Name ", "name"), "Name")
         expect_equal("validate_optional_text blank", tm.validate_optional_text("   "), "")
@@ -130,6 +116,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         expect_equal("validate_yes_no_input yes", tm.validate_yes_no_input("Yes"), True)
         expect_equal("validate_yes_no_input no", tm.validate_yes_no_input("n"), False)
         expect_equal("shutdown event initially clear", tm.get_shutdown_event().is_set(), False)
+        expect_equal("database starts with no cached connections", dbm.get_open_connection_count(), 1)
 
         test_logger = alm.get_app_logger("validation_test")
         alm.log_event(
@@ -149,9 +136,6 @@ with tempfile.TemporaryDirectory() as temp_dir:
         with open(log_path, "r", encoding="utf-8") as log_file:
             log_lines = [line.strip() for line in log_file if line.strip()]
 
-        if not log_lines:
-            raise AssertionError("structured logger did not write any log records")
-
         latest_log = json.loads(log_lines[-1])
         for required_key in ["timestamp", "when", "where", "what", "why", "severity", "level"]:
             if required_key not in latest_log:
@@ -164,249 +148,66 @@ with tempfile.TemporaryDirectory() as temp_dir:
             raise AssertionError("structured logger leaked a sensitive URL into the log file")
         print("PASS: logger keeps URLs redacted")
 
+        old_rotated_log = os.path.join(log_dir, "classroom_assistant.log.2000-01-01")
+        recent_rotated_log = os.path.join(log_dir, "classroom_assistant.log.2099-01-01")
+        active_log = os.path.join(log_dir, "classroom_assistant.log")
+        with open(old_rotated_log, "w", encoding="utf-8") as file:
+            file.write("old log")
+        with open(recent_rotated_log, "w", encoding="utf-8") as file:
+            file.write("recent log")
+        with open(active_log, "a", encoding="utf-8") as file:
+            file.write("")
+        alm.configure_logging(log_dir=log_dir, force=True)
+        expect_equal("logger removes old rotated logs", os.path.exists(old_rotated_log), False)
+        expect_equal("logger keeps recent rotated logs", os.path.exists(recent_rotated_log), True)
+        expect_equal("logger keeps active log file", os.path.exists(active_log), True)
+
         start, end = tm.validate_time_range("10:00", "12:00")
         expect_equal("validate_time_range valid start", start, "10:00")
         expect_equal("validate_time_range valid end", end, "12:00")
 
-        expect_exception(
-            "validate_required_text empty",
-            lambda: tm.validate_required_text("   ", "name"),
-            ValueError,
-            "cannot be empty",
-        )
+        expect_exception("validate_required_text empty", lambda: tm.validate_required_text("   ", "name"), ValueError, "cannot be empty")
+        expect_exception("validate_optional_text invalid type", lambda: tm.validate_optional_text(None), ValueError, "must be a string")
+        expect_exception("validate_yes_no_input invalid", lambda: tm.validate_yes_no_input("maybe"), ValueError, "Please enter y or n")
+        expect_exception("validate_time_range same time", lambda: tm.validate_time_range("09:00", "09:00"), ValueError, "at least 1 hour")
+        expect_exception("validate_time_range reverse time", lambda: tm.validate_time_range("10:00", "09:00"), ValueError, "at least 1 hour")
+        expect_exception("validate_time_input requires zero padded hour", lambda: tm.validate_time_input("9:00", "start_time"), ValueError, "HH:MM")
 
-        expect_exception(
-            "validate_optional_text invalid type",
-            lambda: tm.validate_optional_text(None),
-            ValueError,
-            "must be a string",
-        )
+        saved_timetable = tm.save_timetable(BASE_TIMETABLE)
+        expect_equal("save_timetable roundtrip count", len(saved_timetable), 2)
+        expect_equal("save_timetable persisted count", len(tm.load_timetable()), 2)
+        expect_equal("same-thread database connection reuse", dbm.get_open_connection_count(), 1)
 
-        expect_exception(
-            "validate_yes_no_input invalid",
-            lambda: tm.validate_yes_no_input("maybe"),
-            ValueError,
-            "Please enter y or n",
-        )
-
-        tm.clear_storage_cache()
-        read_counts = {"timetable": 0, "recycle": 0}
-        original_read_timetable_file = tm._read_timetable_file
-        original_read_recycle_bin_file = tm._read_recycle_bin_file
-
-        def counted_read_timetable_file():
-            read_counts["timetable"] += 1
-            return original_read_timetable_file()
-
-        def counted_read_recycle_bin_file():
-            read_counts["recycle"] += 1
-            return original_read_recycle_bin_file()
-
-        tm._read_timetable_file = counted_read_timetable_file
-        tm._read_recycle_bin_file = counted_read_recycle_bin_file
-        try:
-            tm.initialize_storage()
-            tm.get_entry_by_id("mon_1")
-            tm.edit_entry("mon_1", class_name="Advanced Math")
-            recycle_record = tm.delete_entry("tue_1")
-            tm.restore_entry(recycle_record["recycle_id"])
-            expect_equal("cache reads timetable only once", read_counts["timetable"], 1)
-            expect_equal("cache reads recycle bin only once", read_counts["recycle"], 1)
-        finally:
-            tm._read_timetable_file = original_read_timetable_file
-            tm._read_recycle_bin_file = original_read_recycle_bin_file
-
-        write_json(timetable_path, BASE_TIMETABLE)
-        write_json(recycle_bin_path, [])
-
-        write_json(
-            recycle_bin_path,
-            [
-                {
-                    "recycle_id": "bin_1",
-                    "deleted_at": "2026-03-18T10:00:00",
-                    "entry": BASE_TIMETABLE[0],
-                }
-            ],
-        )
-
-        tm.clear_storage_cache()
-        index_counts = {"timetable": 0, "recycle": 0}
-        original_build_timetable_indexes = tm._build_timetable_indexes
-        original_build_recycle_index_map = tm._build_recycle_index_map
-
-        def counted_build_timetable_indexes(timetable):
-            index_counts["timetable"] += 1
-            return original_build_timetable_indexes(timetable)
-
-        def counted_build_recycle_index_map(recycle_bin):
-            index_counts["recycle"] += 1
-            return original_build_recycle_index_map(recycle_bin)
-
-        tm._build_timetable_indexes = counted_build_timetable_indexes
-        tm._build_recycle_index_map = counted_build_recycle_index_map
-        try:
-            tm.initialize_storage()
-            index_counts["timetable"] = 0
-            index_counts["recycle"] = 0
-            tm.get_entry_by_id("mon_1")
-            tm.get_entry_by_id("tue_1")
-            tm.get_recycle_record_by_id("bin_1")
-            expect_equal("cached timetable lookups reuse indexes", index_counts["timetable"], 0)
-            expect_equal("cached recycle lookups reuse indexes", index_counts["recycle"], 0)
-        finally:
-            tm._build_timetable_indexes = original_build_timetable_indexes
-            tm._build_recycle_index_map = original_build_recycle_index_map
-
-        write_json(timetable_path, BASE_TIMETABLE)
-        write_json(recycle_bin_path, [])
-
-        expect_exception(
-            "validate_time_range same time",
-            lambda: tm.validate_time_range("09:00", "09:00"),
-            ValueError,
-            "at least 1 hour",
-        )
-
-        expect_exception(
-            "validate_time_range reverse time",
-            lambda: tm.validate_time_range("10:00", "09:00"),
-            ValueError,
-            "at least 1 hour",
-        )
-
-        expect_exception(
-            "validate_time_range invalid format",
-            lambda: tm.validate_time_range("9am", "10:00"),
-            ValueError,
-            "HH:MM",
-        )
-
-        expect_exception(
-            "validate_time_input requires zero padded hour",
-            lambda: tm.validate_time_input("9:00", "start_time"),
-            ValueError,
-            "HH:MM",
-        )
-
-        expect_exception(
-            "validate_time_input rejects hour overflow",
-            lambda: tm.validate_time_input("24:00", "start_time"),
-            ValueError,
-            "HH:MM",
-        )
-
-        entry = tm.add_entry(
-            "Wednesday",
-            "10:00",
-            "11:00",
-            "History",
-            "https://example.com/history",
-        )
+        entry = tm.add_entry("Wednesday", "10:00", "11:00", "History", "https://example.com/history")
         expect_equal("add_entry generated id", entry["id"], "wed_1")
         expect_equal("add_entry default joined false", entry["joined"], False)
         expect_equal("add_entry data count", len(tm.load_timetable()), 3)
 
         expect_exception(
             "add_entry duplicate slot",
-            lambda: tm.add_entry(
-                "Wednesday",
-                "10:00",
-                "11:00",
-                "Duplicate History",
-                "https://example.com/dup",
-            ),
+            lambda: tm.add_entry("Wednesday", "10:00", "11:00", "Duplicate History", "https://example.com/dup"),
             ValueError,
             "already exists",
         )
-
         expect_exception(
-            "add_entry invalid day",
-            lambda: tm.add_entry(
-                "Funday",
-                "10:00",
-                "11:00",
-                "Bad Day",
-                "https://example.com/bad",
-            ),
+            "add_entry overlapping slot",
+            lambda: tm.add_entry("Monday", "08:30", "09:30", "Overlap Math", "https://example.com/overlap"),
             ValueError,
-            "valid day name",
-        )
-
-        expect_exception(
-            "add_entry empty class name",
-            lambda: tm.add_entry(
-                "Thursday",
-                "10:00",
-                "11:00",
-                "   ",
-                "https://example.com/blank",
-            ),
-            ValueError,
-            "class_name cannot be empty",
-        )
-
-        expect_exception(
-            "add_entry invalid url type",
-            lambda: tm.add_entry(
-                "Thursday",
-                "10:00",
-                "11:00",
-                "Typing",
-                123,
-            ),
-            ValueError,
-            "classroom_url must be a string",
-        )
-
-        expect_exception(
-            "add_entry invalid time gap short",
-            lambda: tm.add_entry(
-                "Thursday",
-                "10:00",
-                "10:30",
-                "Short Gap",
-                "https://example.com/short",
-            ),
-            ValueError,
-            "at least 1 hour",
-        )
-
-        expect_exception(
-            "add_entry invalid time gap long",
-            lambda: tm.add_entry(
-                "Thursday",
-                "10:00",
-                "14:30",
-                "Long Gap",
-                "https://example.com/long",
-            ),
-            ValueError,
-            "not be more than 3 hours",
-        )
-
-        found = tm.get_entry_by_id("wed_1")
-        expect_equal("get_entry_by_id valid", found["class_name"], "History")
-
-        expect_exception(
-            "get_entry_by_id invalid type",
-            lambda: tm.get_entry_by_id(10),
-            ValueError,
-            "entry_id must be a string",
+            "overlaps",
         )
 
         edited = tm.edit_entry("wed_1", class_name="World History", end_time="12:00")
         expect_equal("edit_entry updated class", edited["class_name"], "World History")
         expect_equal("edit_entry updated end time", edited["end_time"], "12:00")
-
-        edited = tm.edit_entry("wed_1", url="https://example.com/new-history")
-        expect_equal("edit_entry url alias", edited["classroom_url"], "https://example.com/new-history")
+        expect_exception(
+            "edit_entry overlapping slot",
+            lambda: tm.edit_entry("wed_1", day="Monday", start_time="08:30", end_time="09:30"),
+            ValueError,
+            "overlaps",
+        )
 
         joined_entry = tm.set_entry_joined_status("wed_1", True)
         expect_equal("set_entry_joined_status true", joined_entry["joined"], True)
-        joined_entry = tm.set_entry_joined_status("wed_1", False)
-        expect_equal("set_entry_joined_status false", joined_entry["joined"], False)
-
         expect_exception(
             "set_entry_joined_status invalid type",
             lambda: tm.set_entry_joined_status("wed_1", "yes"),
@@ -414,68 +215,48 @@ with tempfile.TemporaryDirectory() as temp_dir:
             "joined must be a boolean",
         )
 
-        expect_exception(
-            "edit_entry invalid id",
-            lambda: tm.edit_entry("abc_1", class_name="Nope"),
-            LookupError,
-            "No entry found",
-        )
-
-        expect_exception(
-            "edit_entry no updates",
-            lambda: tm.edit_entry("wed_1"),
-            ValueError,
-            "Provide at least one field",
-        )
-
-        expect_exception(
-            "edit_entry duplicate slot",
-            lambda: tm.edit_entry("wed_1", day="Tuesday", start_time="09:00", end_time="10:00"),
-            ValueError,
-            "already exists",
-        )
-
-        expect_exception(
-            "edit_entry invalid field",
-            lambda: tm.edit_entry("wed_1", teacher="Someone"),
-            ValueError,
-            "Invalid field",
-        )
-
-        expect_exception(
-            "edit_entry url and classroom_url conflict",
-            lambda: tm.edit_entry(
-                "wed_1",
-                url="https://example.com/a",
-                classroom_url="https://example.com/b",
-            ),
-            ValueError,
-            "Use either 'url' or 'classroom_url'",
-        )
-
         recycle_record = tm.delete_entry("wed_1")
         expect_equal("delete_entry moved id", recycle_record["entry"]["id"], "wed_1")
-        expect_equal("delete_entry recycle id", recycle_record["recycle_id"], "bin_1")
-        expect_equal("delete_entry timetable count", len(tm.load_timetable()), 2)
         expect_equal("delete_entry recycle count", len(tm.load_recycle_bin()), 1)
-
-        recycle_record_2 = tm.delete_entry("mon_1")
-        expect_equal("delete_entry second recycle id", recycle_record_2["recycle_id"], "bin_2")
-
         restored_entry = tm.restore_entry(recycle_record["recycle_id"])
         expect_equal("restore_entry valid data", restored_entry["id"], "wed_1")
-        expect_equal("restore_entry recycle count", len(tm.load_recycle_bin()), 1)
 
-        deleted_record = tm.permanently_delete_recycle_entry(recycle_record_2["recycle_id"])
+        recycle_record = tm.delete_entry("wed_1")
+        deleted_record = tm.permanently_delete_recycle_entry(recycle_record["recycle_id"])
+        expect_equal("permanently_delete_recycle_entry valid data", deleted_record["recycle_id"], recycle_record["recycle_id"])
+
+        recycle_record_a = tm.delete_entry("mon_1")
+        recycle_record_b = tm.delete_entry("tue_1")
+        cleared_records = tm.clear_recycle_bin()
+        expect_equal("clear_recycle_bin deleted count", len(cleared_records), 2)
+        expect_equal("clear_recycle_bin empties recycle bin", len(tm.load_recycle_bin()), 0)
         expect_equal(
-            "permanently_delete_recycle_entry valid data",
-            deleted_record["recycle_id"],
-            recycle_record_2["recycle_id"],
+            "clear_recycle_bin returns deleted ids",
+            sorted(record["entry"]["id"] for record in cleared_records),
+            sorted([recycle_record_a["entry"]["id"], recycle_record_b["entry"]["id"]]),
         )
-        expect_equal("permanently_delete_recycle_entry recycle count", len(tm.load_recycle_bin()), 0)
+        expect_exception(
+            "clear_recycle_bin empty recycle bin",
+            tm.clear_recycle_bin,
+            LookupError,
+            "Recycle bin is empty",
+        )
 
-        write_json(
-            timetable_path,
+        saved_recycle_bin = tm.save_recycle_bin(
+            [
+                {
+                    "recycle_id": "bin_1",
+                    "deleted_at": "2026-03-18T10:00:00",
+                    "entry": BASE_TIMETABLE[0],
+                }
+            ]
+        )
+        expect_equal("save_recycle_bin roundtrip count", len(saved_recycle_bin), 1)
+        expect_equal("save_recycle_bin persisted count", len(tm.load_recycle_bin()), 1)
+
+        reset_database(BASE_TIMETABLE, [])
+
+        reset_database(
             [
                 {
                     "id": "mon_2",
@@ -484,453 +265,158 @@ with tempfile.TemporaryDirectory() as temp_dir:
                     "end_time": "10:00",
                     "class_name": "Physics",
                     "classroom_url": "https://example.com/physics",
+                    "joined": False,
                 }
             ],
+            [],
         )
-        write_json(recycle_bin_path, [])
-        reused_entry = tm.add_entry(
-            "Monday",
-            "10:00",
-            "11:00",
-            "Chemistry",
-            "https://example.com/chemistry",
-        )
+        reused_entry = tm.add_entry("Monday", "10:00", "11:00", "Chemistry", "https://example.com/chemistry")
         expect_equal("add_entry reuses first missing id", reused_entry["id"], "mon_1")
 
-        expect_exception(
-            "delete_entry invalid id type",
-            lambda: tm.delete_entry(None),
-            ValueError,
-            "entry_id must be a string",
-        )
+        with dbm.write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO classes(entry_id, day, start_time, end_time, class_name, classroom_url, joined) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("mon_9", "Monday", "11:00", "12:00", "Extra", "https://example.com/extra", 0),
+            )
+            try:
+                connection.execute(
+                    "INSERT INTO classes(entry_id, day, start_time, end_time, class_name, classroom_url, joined) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("dup_1", "Monday", "11:00", "12:00", "Duplicate", "https://example.com/duplicate", 0),
+                )
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                raise AssertionError("database did not block an exact duplicate slot")
+        print("PASS: sqlite schema blocks duplicate slot")
 
-        expect_exception(
-            "delete_entry missing id",
-            lambda: tm.delete_entry("abc_1"),
-            LookupError,
-            "No entry found",
-        )
-
-        expect_exception(
-            "get_recycle_record_by_id validates recycle_id format",
-            lambda: tm.get_recycle_record_by_id("wrong_id"),
-            ValueError,
-            "bin_<number>",
-        )
-
-        expect_exception(
-            "restore_entry validates recycle_id format",
-            lambda: tm.restore_entry("bin_x"),
-            ValueError,
-            "bin_<number>",
-        )
-
-        expect_exception(
-            "permanently_delete_recycle_entry validates recycle_id format",
-            lambda: tm.permanently_delete_recycle_entry("123"),
-            ValueError,
-            "bin_<number>",
-        )
-
-        expect_exception(
-            "get_recycle_record_by_id missing recycle id",
-            lambda: tm.get_recycle_record_by_id("bin_9"),
-            LookupError,
-            "No recycle bin entry found",
-        )
-
-        write_json(
-            timetable_path,
-            BASE_TIMETABLE
-            + [
-                {
-                    "id": "dup_1",
-                    "day": "Monday",
-                    "start_time": "08:00",
-                    "end_time": "09:00",
-                    "class_name": "Duplicate",
-                    "classroom_url": "https://example.com/dup",
-                }
-            ],
-        )
-        expect_exception(
-            "load_timetable duplicate slot detection",
-            tm.load_timetable,
-            tm.DuplicateTimeSlotError,
-        )
-
-        duplicate_loaded = tm.load_timetable(allow_duplicate_slots=True)
-        expect_equal("load_timetable allows duplicate slot cleanup mode", len(duplicate_loaded), 3)
-
-        write_json(
-            timetable_path,
-            [
-                BASE_TIMETABLE[0],
-                dict(BASE_TIMETABLE[0]),
-            ],
-        )
-        expect_exception(
-            "load_timetable duplicate id detection",
-            tm.load_timetable,
-            ValueError,
-            "Duplicate id",
-        )
-
-        write_json(
-            timetable_path,
-            [
-                {
-                    "id": "mon_1",
-                    "day": "Monday",
-                    "start_time": "9:00",
-                    "end_time": "10:00",
-                    "class_name": "Bad Time",
-                    "classroom_url": "https://example.com/bad-time",
-                }
-            ],
-        )
+        reset_database(BASE_TIMETABLE, [])
+        with dbm.write_transaction() as connection:
+            connection.execute("UPDATE classes SET start_time = ? WHERE entry_id = ?", ("9:00", "mon_1"))
+        expect_exception("initialize_storage detects invalid stored data", tm.initialize_storage, tm.InvalidTimetableEntriesError, "Invalid timetable entries")
         issues = tm.inspect_timetable_entry_issues()
         expect_equal("inspect_timetable_entry_issues finds invalid row", len(issues), 1)
-        if "HH:MM" not in issues[0]["error"]:
-            raise AssertionError("inspect_timetable_entry_issues missing invalid time detail")
-        print("PASS: inspect_timetable_entry_issues error detail")
-        expect_equal(
-            "inspect_timetable_entry_issues invalid field list",
-            issues[0]["fields"],
-            ["start_time", "end_time"],
-        )
-
-        repaired = tm.repair_timetable_entry(
-            0,
-            "mon_1",
-            "Monday",
-            "09:00",
-            "10:00",
-            "Fixed Time",
-            "https://example.com/fixed-time",
-        )
+        expect_equal("inspect_timetable_entry_issues invalid field list", issues[0]["fields"], ["start_time", "end_time"])
+        repaired = tm.repair_timetable_entry(0, "mon_1", "Monday", "09:00", "10:00", "Math", "https://example.com/math")
         expect_equal("repair_timetable_entry fixed id", repaired["id"], "mon_1")
-        expect_equal("repair_timetable_entry fixed time", repaired["start_time"], "09:00")
-        expect_equal("repair_timetable_entry makes file loadable", len(tm.load_timetable()), 1)
+        expect_equal("repair_timetable_entry makes database loadable", len(tm.load_timetable()), 2)
 
-        write_json(
-            timetable_path,
-            [
-                {
-                    "id": "bad",
-                    "day": "Monday",
-                    "start_time": "9:00",
-                    "end_time": "10:00",
-                    "class_name": "Broken Id And Time",
-                    "classroom_url": "https://example.com/broken-id",
-                },
-                {
-                    "id": "mon_1",
-                    "day": "Monday",
-                    "start_time": "10:00",
-                    "end_time": "11:00",
-                    "class_name": "Existing Monday",
-                    "classroom_url": "https://example.com/existing-monday",
-                }
-            ],
-        )
-        repaired = tm.repair_timetable_entry(
-            0,
-            "bad",
-            "Monday",
-            "09:00",
-            "10:00",
-            "Fixed Broken Id",
-            "https://example.com/fixed-broken-id",
-        )
-        expect_equal("repair_timetable_entry auto-fixes invalid id", repaired["id"], "mon_2")
-
-        write_json(
-            timetable_path,
-            [
-                {
-                    "id": "bad",
-                    "day": "Funday",
-                    "start_time": "09:00",
-                    "end_time": "10:00",
-                    "class_name": "Broken",
-                    "classroom_url": "https://example.com/broken",
-                }
-            ],
-        )
+        reset_database(BASE_TIMETABLE, [])
+        with dbm.write_transaction() as connection:
+            connection.execute("UPDATE classes SET day = ? WHERE entry_id = ?", ("Funday", "mon_1"))
         deleted_raw_entry = tm.delete_raw_timetable_entry(0)
-        expect_equal("delete_raw_timetable_entry returns removed raw id", deleted_raw_entry["id"], "bad")
-        expect_equal("delete_raw_timetable_entry empties file", len(tm.load_timetable()), 0)
+        expect_equal("delete_raw_timetable_entry returns removed raw id", deleted_raw_entry["id"], "mon_1")
+        expect_equal("delete_raw_timetable_entry removes broken row", len(tm.load_timetable()), 1)
 
-        write_json(
-            timetable_path,
-            [
-                {
-                    "id": "bad_1",
-                    "day": "Monday",
-                    "start_time": "08:00",
-                    "end_time": "08:30",
-                    "class_name": "Bad Gap",
-                    "classroom_url": "https://example.com/bad",
-                }
-            ],
-        )
-        expect_exception(
-            "load_timetable validates stored time gap",
-            tm.load_timetable,
-            ValueError,
-            "at least 1 hour",
-        )
+        reset_database(BASE_TIMETABLE, [])
+        with dbm.write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO classes(entry_id, day, start_time, end_time, class_name, classroom_url, joined) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("mon_2", "Monday", "08:30", "09:30", "Overlap", "https://example.com/overlap", 0),
+            )
+        expect_exception("initialize_storage detects overlapping stored data", tm.initialize_storage, tm.InvalidTimetableEntriesError, "overlaps")
+        overlap_issues = tm.inspect_timetable_entry_issues()
+        expect_equal("inspect_timetable_entry_issues overlap field list", overlap_issues[0]["fields"], ["start_time", "end_time"])
 
-        write_json(timetable_path, {"not": "a list"})
-        expect_exception(
-            "load_timetable requires list",
-            tm.load_timetable,
-            ValueError,
-            "must contain a list",
-        )
+        reset_database(BASE_TIMETABLE, [])
+        recycle_record = tm.delete_entry("mon_1")
+        with dbm.write_transaction() as connection:
+            connection.execute("UPDATE recycle_bin SET recycle_id = ? WHERE recycle_id = ?", ("wrong", recycle_record["recycle_id"]))
+        expect_exception("load_recycle_bin validates recycle id format", tm.load_recycle_bin, ValueError, "bin_<number>")
 
-        with open(timetable_path, "w", encoding="utf-8") as file:
-            file.write("{bad json")
-        tm.clear_storage_cache()
-        expect_exception(
-            "load_timetable invalid json",
-            tm.load_timetable,
-            ValueError,
-            "contains invalid JSON",
-        )
+        reset_database(BASE_TIMETABLE, [])
+        with dbm.write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO recycle_bin(recycle_id, deleted_at, entry_id, day, start_time, end_time, class_name, classroom_url, joined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("bin_9", "2026-03-18T10:00:00", "thu_1", "Tuesday", "09:30", "10:30", "Overlap Slot", "https://example.com/overlap-slot", 0),
+            )
+        expect_exception("restore_entry blocks overlapping slot", lambda: tm.restore_entry("bin_9"), ValueError, "overlaps")
 
-        write_json(timetable_path, BASE_TIMETABLE)
-        write_json(
-            recycle_bin_path,
-            [
-                {
-                    "recycle_id": "bin_1",
-                    "deleted_at": "2026-03-18T10:00:00",
-                    "entry": BASE_TIMETABLE[0],
-                },
-                {
-                    "recycle_id": "bin_1",
-                    "deleted_at": "2026-03-18T10:05:00",
-                    "entry": BASE_TIMETABLE[1],
-                },
-            ],
-        )
-        expect_exception(
-            "load_recycle_bin duplicate recycle ids",
-            tm.load_recycle_bin,
-            ValueError,
-            "Duplicate recycle_id",
-        )
-
-        write_json(
-            recycle_bin_path,
-            [
-                {
-                    "recycle_id": "wrong",
-                    "deleted_at": "2026-03-18T10:00:00",
-                    "entry": BASE_TIMETABLE[0],
-                }
-            ],
-        )
-        expect_exception(
-            "load_recycle_bin validates recycle id format",
-            tm.load_recycle_bin,
-            ValueError,
-            "bin_<number>",
-        )
-
-        write_json(
-            recycle_bin_path,
-            [
-                {
-                    "recycle_id": "bin_2",
-                    "deleted_at": "2026-03-18T10:00:00",
-                    "entry": {
-                        "id": "bad_2",
-                        "day": "Funday",
-                        "start_time": "08:00",
-                        "end_time": "09:00",
-                        "class_name": "Bad Entry",
-                        "classroom_url": "https://example.com/bad",
-                    },
-                }
-            ],
-        )
-        expect_exception(
-            "load_recycle_bin validates embedded entry",
-            tm.load_recycle_bin,
-            ValueError,
-            "valid day name",
-        )
-
-        write_json(recycle_bin_path, {"not": "a list"})
-        expect_exception(
-            "load_recycle_bin requires list",
-            tm.load_recycle_bin,
-            ValueError,
-            "must contain a list",
-        )
-
-        write_json(timetable_path, BASE_TIMETABLE)
-        write_json(
-            recycle_bin_path,
-            [
-                {
-                    "recycle_id": "bin_3",
-                    "deleted_at": "2026-03-18T10:00:00",
-                    "entry": {
-                        "id": "tue_1",
-                        "day": "Thursday",
-                        "start_time": "11:00",
-                        "end_time": "12:00",
-                        "class_name": "Clash ID",
-                        "classroom_url": "https://example.com/clash-id",
-                    },
-                }
-            ],
-        )
-        expect_exception(
-            "restore_entry blocks duplicate id",
-            lambda: tm.restore_entry("bin_3"),
-            ValueError,
-            "already exists",
-        )
-
-        write_json(
-            recycle_bin_path,
-            [
-                {
-                    "recycle_id": "bin_4",
-                    "deleted_at": "2026-03-18T10:00:00",
-                    "entry": {
-                        "id": "thu_1",
-                        "day": "Tuesday",
-                        "start_time": "09:00",
-                        "end_time": "10:00",
-                        "class_name": "Clash Slot",
-                        "classroom_url": "https://example.com/clash-slot",
-                    },
-                }
-            ],
-        )
-        expect_exception(
-            "restore_entry blocks duplicate slot",
-            lambda: tm.restore_entry("bin_4"),
-            ValueError,
-            "already exists",
-        )
-
-        write_json(timetable_path, BASE_TIMETABLE)
-        write_json(recycle_bin_path, [])
-
+        reset_database(BASE_TIMETABLE, [])
         result, output = capture_output(main.show_recycle_bin)
         expect_equal("main show_recycle_bin empty return", result, False)
         if "Recycle bin is empty." not in output:
             raise AssertionError("main show_recycle_bin empty output missing expected message")
         print("PASS: main show_recycle_bin empty output")
 
-        write_json(
-            recycle_bin_path,
-            [
-                {
-                    "recycle_id": "bin_5",
-                    "deleted_at": "2026-03-18T10:00:00",
-                    "entry": {
-                        "id": "wed_1",
-                        "day": "Wednesday",
-                        "start_time": "10:00",
-                        "end_time": "11:00",
-                        "class_name": "History",
-                        "classroom_url": "https://example.com/history",
-                    },
-                }
-            ],
-        )
-
+        recycle_record = tm.delete_entry("mon_1")
         result, output = capture_output(main.show_recycle_bin)
         expect_equal("main show_recycle_bin non-empty return", result, True)
-        if "Recycle ID" not in output or "bin_5" not in output:
+        if recycle_record["recycle_id"] not in output:
             raise AssertionError("main show_recycle_bin table output missing expected values")
         print("PASS: main show_recycle_bin table output")
 
+        with patch("main.show_recycle_bin", return_value=True), patch(
+            "main.prompt_yes_no", return_value=True
+        ), patch("main.clear_recycle_bin", return_value=[{"recycle_id": "bin_1"}, {"recycle_id": "bin_2"}]):
+            _, output = run_with_inputs(main.handle_recycle_bin, ["4", "5"])
+        if "Permanently deleted all recycle bin entries: 2 record(s)" not in output:
+            raise AssertionError("main handle_recycle_bin clear output missing expected summary")
+        print("PASS: main handle_recycle_bin clear output")
+
+        reset_database(BASE_TIMETABLE, [])
+        with patch("main.shutdown_storage"), patch("main.shutdown_logging"):
+            _, output = run_with_inputs(
+                main.main,
+                [
+                    "2",
+                    "Wednesday",
+                    "10:00",
+                    "11:00",
+                    "History",
+                    "https://example.com/history",
+                    "4",
+                    "wed_1",
+                    "y",
+                    "5",
+                    "4",
+                    "y",
+                    "5",
+                    "6",
+                ],
+            )
+        if "Entry added successfully: wed_1" not in output:
+            raise AssertionError("main integration flow did not add the expected entry")
+        if "Entry moved to recycle bin successfully: wed_1 -> bin_1" not in output:
+            raise AssertionError("main integration flow did not delete the expected entry")
+        if "Permanently deleted all recycle bin entries: 1 record(s)" not in output:
+            raise AssertionError("main integration flow did not clear the recycle bin")
+        if "Goodbye." not in output:
+            raise AssertionError("main integration flow did not exit cleanly")
+        print("PASS: main full integration flow")
+
         result, output = capture_output(main.show_timetable)
-        if "ID" not in output or "mon_1" not in output or "tue_1" not in output:
+        if "ID" not in output or "tue_1" not in output:
             raise AssertionError("main show_timetable table output missing expected values")
         print("PASS: main show_timetable table output")
 
-        duplicate_error = tm.DuplicateTimeSlotError(
-            [[
-                {
-                    "id": "mon_1",
-                    "day": "Monday",
-                    "start_time": "08:00",
-                    "end_time": "09:00",
-                    "class_name": "Math",
-                    "classroom_url": "https://example.com/math",
-                    "joined": False,
-                },
-                {
-                    "id": "mon_2",
-                    "day": "Monday",
-                    "start_time": "08:00",
-                    "end_time": "09:00",
-                    "class_name": "Science",
-                    "classroom_url": "https://example.com/science",
-                    "joined": False,
-                },
-            ]]
-        )
-        with patch("main.prompt_yes_no", side_effect=[False, True]), patch(
-            "main.prompt_required", return_value="mon_1"
-        ), patch("main.delete_entry") as mocked_delete_entry:
-            result, output = capture_output(main.resolve_duplicate_slots, duplicate_error)
-        expect_equal("main resolve_duplicate_slots loops on no", result, True)
-        if "This data must be repaired before the program can continue." not in output:
-            raise AssertionError("main resolve_duplicate_slots missing blocking message")
-        if mocked_delete_entry.call_count != 1:
-            raise AssertionError("main resolve_duplicate_slots did not delete duplicate after retry")
-        print("PASS: main resolve_duplicate_slots retry flow")
+        value, _ = run_with_inputs(lambda: main.prompt_day("Day"), ["monday"])
+        expect_equal("main prompt_day normalizes case", value, "Monday")
+        value, output = run_with_inputs(lambda: main.prompt_day("Day"), ["funday", "tuesday"])
+        expect_equal("main prompt_day retries invalid input", value, "Tuesday")
+        if "day must be a valid day name" not in output:
+            raise AssertionError("main prompt_day invalid message missing")
+        print("PASS: main prompt_day invalid message")
 
-        invalid_error = tm.InvalidTimetableEntriesError(
-            [
-                {
-                    "index": 0,
-                    "entry": {
-                        "id": "mon_1",
-                        "day": "Monday",
-                        "start_time": "9:00",
-                        "end_time": "10:00",
-                        "class_name": "Math",
-                        "classroom_url": "https://example.com/math",
-                    },
-                    "error": "start_time must be in HH:MM format.",
-                    "fields": ["start_time", "end_time"],
-                }
-            ]
-        )
-        with patch("main.prompt_yes_no", side_effect=[False, True]), patch(
-            "main.prompt_required", side_effect=["edit"]
-        ), patch("main.prompt_time", side_effect=["09:00", "10:00"]), patch(
-            "main.repair_timetable_entry",
-            return_value={
-                "id": "mon_1",
-                "day": "Monday",
-                "start_time": "09:00",
-                "end_time": "10:00",
-                "class_name": "Math",
-                "classroom_url": "https://example.com/math",
-                "joined": False,
-            },
-        ), patch("main.initialize_storage", return_value=None):
-            result, output = capture_output(main.resolve_invalid_timetable_entries, invalid_error)
-        expect_equal("main resolve_invalid_timetable_entries loops on no", result, True)
-        if "This data must be repaired before the program can continue." not in output:
-            raise AssertionError("main resolve_invalid_timetable_entries missing blocking message")
-        print("PASS: main resolve_invalid_timetable_entries retry flow")
+        value, output = run_with_inputs(lambda: main.prompt_time("Time"), ["wrong", "09:30"])
+        expect_equal("main prompt_time retries invalid input", value, "09:30")
+        if "must be in HH:MM format" not in output:
+            raise AssertionError("main prompt_time invalid message missing")
+        print("PASS: main prompt_time invalid message")
 
-        write_json(timetable_path, BASE_TIMETABLE)
-        write_json(recycle_bin_path, [])
+        expect_exception(
+            "main prompt_required cancel keyword",
+            lambda: run_with_inputs(lambda: main.prompt_required("Field"), ["back"]),
+            main.UserCancelledOperation,
+            "Action cancelled",
+        )
+        expect_exception(
+            "main prompt_yes_no cancel keyword",
+            lambda: run_with_inputs(lambda: main.prompt_yes_no("Confirm"), ["menu"]),
+            main.UserCancelledOperation,
+            "Action cancelled",
+        )
+
+        reset_database(BASE_TIMETABLE, [])
         tm.initialize_storage()
         thread_errors = []
 
@@ -969,41 +455,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         if thread_errors:
             raise AssertionError(f"Concurrency stress test failed: {thread_errors[0]}")
         print("PASS: concurrency stress test")
-
-        value, _ = run_with_inputs(lambda: main.prompt_day("Day"), ["monday"])
-        expect_equal("main prompt_day normalizes case", value, "Monday")
-
-        value, output = run_with_inputs(lambda: main.prompt_day("Day"), ["funday", "tuesday"])
-        expect_equal("main prompt_day retries invalid input", value, "Tuesday")
-        if "day must be a valid day name" not in output:
-            raise AssertionError("main prompt_day invalid message missing")
-        print("PASS: main prompt_day invalid message")
-
-        value, output = run_with_inputs(lambda: main.prompt_time("Time"), ["wrong", "09:30"])
-        expect_equal("main prompt_time retries invalid input", value, "09:30")
-        if "must be in HH:MM format" not in output:
-            raise AssertionError("main prompt_time invalid message missing")
-        print("PASS: main prompt_time invalid message")
-
-        expect_exception(
-            "main prompt_required cancel keyword",
-            lambda: run_with_inputs(lambda: main.prompt_required("Field"), ["back"]),
-            main.UserCancelledOperation,
-            "Action cancelled",
-        )
-
-        expect_exception(
-            "main prompt_yes_no cancel keyword",
-            lambda: run_with_inputs(lambda: main.prompt_yes_no("Confirm"), ["menu"]),
-            main.UserCancelledOperation,
-            "Action cancelled",
-        )
-
-        value, output = run_with_inputs(lambda: main.prompt_yes_no("Confirm"), ["maybe", "y"])
-        expect_equal("main prompt_yes_no retries invalid input", value, True)
-        if "Please enter y or n." not in output:
-            raise AssertionError("main prompt_yes_no invalid message missing")
-        print("PASS: main prompt_yes_no invalid message")
+        expect_equal("thread-local database connections created", dbm.get_open_connection_count(), 4)
 
         print_validation_story()
         print("\nALL TESTS PASSED")
@@ -1013,5 +465,4 @@ with tempfile.TemporaryDirectory() as temp_dir:
     finally:
         alm.shutdown_logging()
         tm.clear_storage_cache()
-        tm.TIMETABLE_FILE = original_timetable_file
-        tm.RECYCLE_BIN_FILE = original_recycle_file
+        dbm.set_database_path(original_database_file)

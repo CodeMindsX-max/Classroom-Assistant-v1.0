@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
@@ -21,6 +22,9 @@ SENSITIVE_KEYWORDS = {
     "token",
     "url",
 }
+ROTATED_LOG_PATTERN = re.compile(
+    rf"^{re.escape(DEFAULT_LOG_FILENAME)}\.(\d{{4}}-\d{{2}}-\d{{2}})$"
+)
 
 _LOGGER_LOCK = threading.RLock()
 
@@ -133,24 +137,32 @@ def get_log_file_path(log_dir=None):
     return os.path.join(directory, DEFAULT_LOG_FILENAME)
 
 
+def _extract_rotated_log_date(file_name):
+    match = ROTATED_LOG_PATTERN.fullmatch(file_name)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
 def _cleanup_old_logs(log_dir, retention_days):
-    cutoff = datetime.now() - timedelta(days=retention_days)
-    base_name = DEFAULT_LOG_FILENAME
+    cutoff_date = (datetime.now() - timedelta(days=retention_days)).date()
+    active_file_name = DEFAULT_LOG_FILENAME
 
     for file_name in os.listdir(log_dir):
-        if not file_name.startswith(base_name):
+        if file_name == active_file_name:
             continue
 
         file_path = os.path.join(log_dir, file_name)
         if not os.path.isfile(file_path):
             continue
 
-        try:
-            modified_at = datetime.fromtimestamp(os.path.getmtime(file_path))
-        except OSError:
+        rotated_date = _extract_rotated_log_date(file_name)
+        if rotated_date is None:
             continue
-
-        if modified_at < cutoff:
+        if rotated_date < cutoff_date:
             try:
                 os.remove(file_path)
             except OSError:
