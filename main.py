@@ -2,7 +2,6 @@ from timetable_manager import (
     DuplicateTimeSlotError,
     InvalidTimetableEntriesError,
     add_entry,
-    build_validated_entry,
     delete_entry,
     delete_raw_timetable_entry,
     edit_entry,
@@ -14,8 +13,8 @@ from timetable_manager import (
     permanently_delete_recycle_entry,
     repair_timetable_entry,
     restore_entry,
+    shutdown_storage,
     validate_day_input,
-    validate_entry_id,
     validate_optional_text,
     validate_required_text,
     validate_time_input,
@@ -203,68 +202,71 @@ def show_recycle_bin():
 # This guides the user through duplicate-slot cleanup on startup
 # and returns whether the app can continue normal work afterward.
 def resolve_duplicate_slots(error):
-    print("\nDuplicate timetable slots were found in timetable.json.")
+    while True:
+        print("\nDuplicate timetable slots were found in timetable.json.")
 
-    for group_number, duplicate_group in enumerate(error.duplicates, start=1):
-        first_entry = duplicate_group[0]
-        print(
-            f"\nDuplicate group {group_number}: "
-            f"{first_entry['day']} {first_entry['start_time']}-{first_entry['end_time']}"
-        )
-        for entry in duplicate_group:
+        for group_number, duplicate_group in enumerate(error.duplicates, start=1):
+            first_entry = duplicate_group[0]
             print(
-                f"  ID: {entry['id']} | Class: {entry['class_name']} | "
-                f"URL: {entry['classroom_url']}"
+                f"\nDuplicate group {group_number}: "
+                f"{first_entry['day']} {first_entry['start_time']}-{first_entry['end_time']}"
             )
-
-    if not prompt_yes_no("Do you want to delete duplicate entries now?"):
-        print("Please clean the duplicate timetable entries before continuing.")
-        return False
-
-    for duplicate_group in error.duplicates:
-        while True:
-            keep_id = prompt_required(
-                f"Enter the ID you want to keep for "
-                f"{duplicate_group[0]['day']} "
-                f"{duplicate_group[0]['start_time']}-{duplicate_group[0]['end_time']}"
-            )
-            valid_ids = {entry["id"] for entry in duplicate_group}
-            if keep_id not in valid_ids:
-                print("Invalid ID. Please choose one of the IDs shown above.")
-                continue
-
             for entry in duplicate_group:
-                if entry["id"] != keep_id:
-                    delete_entry(entry["id"], allow_duplicate_slots=True)
-                    print(f"Deleted duplicate entry: {entry['id']}")
-            break
+                print(
+                    f"  ID: {entry['id']} | Class: {entry['class_name']} | "
+                    f"URL: {entry['classroom_url']}"
+                )
 
-    print("Duplicate timetable entries were cleaned successfully.")
-    return True
+        if not prompt_yes_no("Do you want to delete duplicate entries now?"):
+            print("This data must be repaired before the program can continue.")
+            continue
+
+        for duplicate_group in error.duplicates:
+            while True:
+                keep_id = prompt_required(
+                    f"Enter the ID you want to keep for "
+                    f"{duplicate_group[0]['day']} "
+                    f"{duplicate_group[0]['start_time']}-{duplicate_group[0]['end_time']}"
+                )
+                valid_ids = {entry["id"] for entry in duplicate_group}
+                if keep_id not in valid_ids:
+                    print("Invalid ID. Please choose one of the IDs shown above.")
+                    continue
+
+                for entry in duplicate_group:
+                    if entry["id"] != keep_id:
+                        delete_entry(entry["id"], allow_duplicate_slots=True)
+                        print(f"Deleted duplicate entry: {entry['id']}")
+                break
+
+        print("Duplicate timetable entries were cleaned successfully.")
+        return True
 
 
 # This guides the user through malformed stored timetable rows on startup
 # and returns whether the app can continue after those bad entries are fixed or removed.
 def resolve_invalid_timetable_entries(error):
     try:
-        print("\nInvalid timetable entries were found in timetable.json.")
-
-        for issue_number, issue in enumerate(error.issues, start=1):
-            print(f"\nInvalid entry {issue_number} at position {issue['index']}:")
-            print(f"  Error: {issue['error']}")
-            print(f"  Stored data: {issue['entry']}")
-
-        if not prompt_yes_no("Do you want to repair or delete these invalid entries now?"):
-            print("Please fix the invalid timetable entries before continuing.")
-            return False
-
         while True:
+            print("\nInvalid timetable entries were found in timetable.json.")
+
             current_issues = error.issues
             if not current_issues:
                 print("All invalid timetable entries were repaired successfully.")
                 return True
 
+            for issue_number, listed_issue in enumerate(current_issues, start=1):
+                print(f"\nInvalid entry {issue_number} at position {listed_issue['index']}:")
+                print(f"  Error: {listed_issue['error']}")
+                print(f"  Stored data: {listed_issue['entry']}")
+
+            if not prompt_yes_no("Do you want to repair or delete these invalid entries now?"):
+                print("This data must be repaired before the program can continue.")
+                continue
+
             issue = current_issues[0]
+            issue_entry = issue["entry"]
+            invalid_fields = set(issue.get("fields", []))
             print(f"\nWorking on invalid entry at position {issue['index']}:")
             print(f"  Error: {issue['error']}")
             print(f"  Stored data: {issue['entry']}")
@@ -275,27 +277,29 @@ def resolve_invalid_timetable_entries(error):
                 print(f"Deleted invalid entry: {deleted_entry}")
             elif action == "edit":
                 while True:
-                    entry_id = prompt_required("New entry ID")
-                    day = prompt_day("Day")
-                    start_time = prompt_time("Start time (HH:MM)")
-                    end_time = prompt_time("End time (HH:MM)")
-                    class_name = prompt_required("Class name")
-                    classroom_url = prompt_required("Classroom URL")
+                    day = issue_entry.get("day", "")
+                    start_time = issue_entry.get("start_time", "")
+                    end_time = issue_entry.get("end_time", "")
+                    class_name = issue_entry.get("class_name", "")
+                    classroom_url = issue_entry.get("classroom_url", "")
+
+                    if "day" in invalid_fields:
+                        day = prompt_day("Correct day")
+
+                    if "start_time" in invalid_fields or "end_time" in invalid_fields:
+                        start_time = prompt_time("Correct start time (HH:MM)")
+                        end_time = prompt_time("Correct end time (HH:MM)")
+
+                    if "class_name" in invalid_fields:
+                        class_name = prompt_required("Correct class name")
+
+                    if "classroom_url" in invalid_fields:
+                        classroom_url = prompt_required("Correct classroom URL")
 
                     try:
-                        validate_entry_id(entry_id)
-                        validate_time_range(start_time, end_time)
-                        build_validated_entry(
-                            entry_id,
-                            day,
-                            start_time,
-                            end_time,
-                            class_name,
-                            classroom_url,
-                        )
                         repaired_entry = repair_timetable_entry(
                             issue["index"],
-                            entry_id,
+                            issue_entry.get("id", ""),
                             day,
                             start_time,
                             end_time,
@@ -484,53 +488,56 @@ def handle_recycle_bin():
 # shows the menu, and routes the user into each feature.
 def main():
     try:
-        initialize_storage()
-    except InvalidTimetableEntriesError as exc:
-        if not resolve_invalid_timetable_entries(exc):
-            return
-    except DuplicateTimeSlotError as exc:
-        if not resolve_duplicate_slots(exc):
-            return
-    except Exception as exc:
-        print(f"Error: {exc}")
-        return
-
-    while True:
-        print("\nTimetable Manager")
-        print("1. Show timetable")
-        print("2. Add entry")
-        print("3. Edit entry")
-        print("4. Delete entry")
-        print("5. Recycle bin")
-        print("6. Exit")
-
-        choice = input("Choose an option: ").strip()
-
         try:
-            if choice == "1":
-                show_timetable()
-            elif choice == "2":
-                handle_add()
-            elif choice == "3":
-                handle_edit()
-            elif choice == "4":
-                handle_delete()
-            elif choice == "5":
-                handle_recycle_bin()
-            elif choice == "6":
-                print("Goodbye.")
-                break
-            else:
-                print("Invalid choice. Please enter a number from 1 to 6.")
-        except UserCancelledOperation as exc:
-            print(exc)
+            initialize_storage()
         except InvalidTimetableEntriesError as exc:
             if not resolve_invalid_timetable_entries(exc):
-                break
+                return
         except DuplicateTimeSlotError as exc:
-            resolve_duplicate_slots(exc)
+            if not resolve_duplicate_slots(exc):
+                return
         except Exception as exc:
             print(f"Error: {exc}")
+            return
+
+        while True:
+            print("\nTimetable Manager")
+            print("1. Show timetable")
+            print("2. Add entry")
+            print("3. Edit entry")
+            print("4. Delete entry")
+            print("5. Recycle bin")
+            print("6. Exit")
+
+            choice = input("Choose an option: ").strip()
+
+            try:
+                if choice == "1":
+                    show_timetable()
+                elif choice == "2":
+                    handle_add()
+                elif choice == "3":
+                    handle_edit()
+                elif choice == "4":
+                    handle_delete()
+                elif choice == "5":
+                    handle_recycle_bin()
+                elif choice == "6":
+                    print("Goodbye.")
+                    break
+                else:
+                    print("Invalid choice. Please enter a number from 1 to 6.")
+            except UserCancelledOperation as exc:
+                print(exc)
+            except InvalidTimetableEntriesError as exc:
+                if not resolve_invalid_timetable_entries(exc):
+                    break
+            except DuplicateTimeSlotError as exc:
+                resolve_duplicate_slots(exc)
+            except Exception as exc:
+                print(f"Error: {exc}")
+    finally:
+        shutdown_storage()
 
 
 if __name__ == "__main__":

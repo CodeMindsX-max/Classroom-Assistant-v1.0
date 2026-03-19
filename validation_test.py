@@ -2,6 +2,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import traceback
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -122,6 +123,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         expect_equal("validate_time_input valid", tm.validate_time_input("09:30", "start_time"), "09:30")
         expect_equal("validate_yes_no_input yes", tm.validate_yes_no_input("Yes"), True)
         expect_equal("validate_yes_no_input no", tm.validate_yes_no_input("n"), False)
+        expect_equal("shutdown event initially clear", tm.get_shutdown_event().is_set(), False)
 
         start, end = tm.validate_time_range("10:00", "12:00")
         expect_equal("validate_time_range valid start", start, "10:00")
@@ -214,6 +216,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
             "https://example.com/history",
         )
         expect_equal("add_entry generated id", entry["id"], "wed_1")
+        expect_equal("add_entry default joined false", entry["joined"], False)
         expect_equal("add_entry data count", len(tm.load_timetable()), 3)
 
         expect_exception(
@@ -310,6 +313,18 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
         edited = tm.edit_entry("wed_1", url="https://example.com/new-history")
         expect_equal("edit_entry url alias", edited["classroom_url"], "https://example.com/new-history")
+
+        joined_entry = tm.set_entry_joined_status("wed_1", True)
+        expect_equal("set_entry_joined_status true", joined_entry["joined"], True)
+        joined_entry = tm.set_entry_joined_status("wed_1", False)
+        expect_equal("set_entry_joined_status false", joined_entry["joined"], False)
+
+        expect_exception(
+            "set_entry_joined_status invalid type",
+            lambda: tm.set_entry_joined_status("wed_1", "yes"),
+            ValueError,
+            "joined must be a boolean",
+        )
 
         expect_exception(
             "edit_entry invalid id",
@@ -491,6 +506,11 @@ with tempfile.TemporaryDirectory() as temp_dir:
         if "HH:MM" not in issues[0]["error"]:
             raise AssertionError("inspect_timetable_entry_issues missing invalid time detail")
         print("PASS: inspect_timetable_entry_issues error detail")
+        expect_equal(
+            "inspect_timetable_entry_issues invalid field list",
+            issues[0]["fields"],
+            ["start_time", "end_time"],
+        )
 
         repaired = tm.repair_timetable_entry(
             0,
@@ -504,6 +524,38 @@ with tempfile.TemporaryDirectory() as temp_dir:
         expect_equal("repair_timetable_entry fixed id", repaired["id"], "mon_1")
         expect_equal("repair_timetable_entry fixed time", repaired["start_time"], "09:00")
         expect_equal("repair_timetable_entry makes file loadable", len(tm.load_timetable()), 1)
+
+        write_json(
+            timetable_path,
+            [
+                {
+                    "id": "bad",
+                    "day": "Monday",
+                    "start_time": "9:00",
+                    "end_time": "10:00",
+                    "class_name": "Broken Id And Time",
+                    "classroom_url": "https://example.com/broken-id",
+                },
+                {
+                    "id": "mon_1",
+                    "day": "Monday",
+                    "start_time": "10:00",
+                    "end_time": "11:00",
+                    "class_name": "Existing Monday",
+                    "classroom_url": "https://example.com/existing-monday",
+                }
+            ],
+        )
+        repaired = tm.repair_timetable_entry(
+            0,
+            "bad",
+            "Monday",
+            "09:00",
+            "10:00",
+            "Fixed Broken Id",
+            "https://example.com/fixed-broken-id",
+        )
+        expect_equal("repair_timetable_entry auto-fixes invalid id", repaired["id"], "mon_2")
 
         write_json(
             timetable_path,
@@ -718,6 +770,117 @@ with tempfile.TemporaryDirectory() as temp_dir:
         if "ID" not in output or "mon_1" not in output or "tue_1" not in output:
             raise AssertionError("main show_timetable table output missing expected values")
         print("PASS: main show_timetable table output")
+
+        duplicate_error = tm.DuplicateTimeSlotError(
+            [[
+                {
+                    "id": "mon_1",
+                    "day": "Monday",
+                    "start_time": "08:00",
+                    "end_time": "09:00",
+                    "class_name": "Math",
+                    "classroom_url": "https://example.com/math",
+                    "joined": False,
+                },
+                {
+                    "id": "mon_2",
+                    "day": "Monday",
+                    "start_time": "08:00",
+                    "end_time": "09:00",
+                    "class_name": "Science",
+                    "classroom_url": "https://example.com/science",
+                    "joined": False,
+                },
+            ]]
+        )
+        with patch("main.prompt_yes_no", side_effect=[False, True]), patch(
+            "main.prompt_required", return_value="mon_1"
+        ), patch("main.delete_entry") as mocked_delete_entry:
+            result, output = capture_output(main.resolve_duplicate_slots, duplicate_error)
+        expect_equal("main resolve_duplicate_slots loops on no", result, True)
+        if "This data must be repaired before the program can continue." not in output:
+            raise AssertionError("main resolve_duplicate_slots missing blocking message")
+        if mocked_delete_entry.call_count != 1:
+            raise AssertionError("main resolve_duplicate_slots did not delete duplicate after retry")
+        print("PASS: main resolve_duplicate_slots retry flow")
+
+        invalid_error = tm.InvalidTimetableEntriesError(
+            [
+                {
+                    "index": 0,
+                    "entry": {
+                        "id": "mon_1",
+                        "day": "Monday",
+                        "start_time": "9:00",
+                        "end_time": "10:00",
+                        "class_name": "Math",
+                        "classroom_url": "https://example.com/math",
+                    },
+                    "error": "start_time must be in HH:MM format.",
+                    "fields": ["start_time", "end_time"],
+                }
+            ]
+        )
+        with patch("main.prompt_yes_no", side_effect=[False, True]), patch(
+            "main.prompt_required", side_effect=["edit"]
+        ), patch("main.prompt_time", side_effect=["09:00", "10:00"]), patch(
+            "main.repair_timetable_entry",
+            return_value={
+                "id": "mon_1",
+                "day": "Monday",
+                "start_time": "09:00",
+                "end_time": "10:00",
+                "class_name": "Math",
+                "classroom_url": "https://example.com/math",
+                "joined": False,
+            },
+        ), patch("main.initialize_storage", return_value=None):
+            result, output = capture_output(main.resolve_invalid_timetable_entries, invalid_error)
+        expect_equal("main resolve_invalid_timetable_entries loops on no", result, True)
+        if "This data must be repaired before the program can continue." not in output:
+            raise AssertionError("main resolve_invalid_timetable_entries missing blocking message")
+        print("PASS: main resolve_invalid_timetable_entries retry flow")
+
+        write_json(timetable_path, BASE_TIMETABLE)
+        write_json(recycle_bin_path, [])
+        tm.initialize_storage()
+        thread_errors = []
+
+        def reader_worker():
+            try:
+                for _ in range(100):
+                    tm.load_timetable()
+                    tm.get_entry_by_id("mon_1")
+            except Exception as exc:
+                thread_errors.append(exc)
+
+        def joined_worker():
+            try:
+                for index in range(100):
+                    tm.set_entry_joined_status("mon_1", index % 2 == 0)
+            except Exception as exc:
+                thread_errors.append(exc)
+
+        def editor_worker():
+            try:
+                for index in range(30):
+                    tm.edit_entry("tue_1", class_name=f"Science {index}")
+            except Exception as exc:
+                thread_errors.append(exc)
+
+        threads = [
+            threading.Thread(target=reader_worker),
+            threading.Thread(target=joined_worker),
+            threading.Thread(target=editor_worker),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        if thread_errors:
+            raise AssertionError(f"Concurrency stress test failed: {thread_errors[0]}")
+        print("PASS: concurrency stress test")
 
         value, _ = run_with_inputs(lambda: main.prompt_day("Day"), ["monday"])
         expect_equal("main prompt_day normalizes case", value, "Monday")
